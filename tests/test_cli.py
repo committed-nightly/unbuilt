@@ -121,6 +121,38 @@ def test_a_file_with_no_from_reports_the_error_and_exits_zero(dockerfile, capsys
     assert "builds nothing" in capsys.readouterr().out
 
 
+#: The Dockerfile at the top of the README, verbatim. The block under it is
+#: quoted output, so if this stops producing it the README is wrong.
+README_LEAD = """\
+FROM node:20-alpine AS build
+WORKDIR /app
+COPY . .
+RUN npm ci && npm run build
+
+FROM node:20-alpine AS runtime
+WORKDIR /app
+ENV PORT=3000
+ENV PORT=8080
+COPY --from=builder /app/dist ./dist
+EXPOSE ${PORT}
+ENTRYPOINT ["node", "dist/server.js"]
+"""
+
+
+def test_the_readme_lead_example_still_prints_what_the_readme_says(
+    dockerfile, capsys
+):
+    assert main([str(dockerfile(README_LEAD))]) == 1
+    out = capsys.readouterr().out
+    assert "2 stages, building runtime." in out
+    assert "Not built for this target: build." in out
+    assert "line 8  superseded  (runtime)" in out
+    assert "line 10  copy-from-unknown  (runtime)" in out
+    assert "the closest stage name is build" in out
+    assert "2 instructions with no effect on this build." in out
+    assert "line 1  orphan-stage  (build)" in out
+
+
 def test_the_examples_dockerfile_is_the_one_the_readme_describes(capsys):
     # The README quotes this run. If the example or the tool changes, this is
     # the test that notices before a reader does.

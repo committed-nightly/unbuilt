@@ -1,0 +1,85 @@
+name: CI
+
+'on':
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # The Docker-backed tests skip themselves without a daemon, so assert
+      # one is here rather than let a run that tested the interesting half of
+      # the suite report green.
+      - name: a Docker daemon is reachable
+        run: docker info --format 'server {{.ServerVersion}}'
+
+      - run: pip install -e ".[dev]"
+      - run: pytest -q
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install ruff
+      - run: ruff check .
+
+  dogfood:
+    # The README quotes this run. If the example or the tool changes, this is
+    # the job that notices before a reader does.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -e .
+
+      - name: the example reports what the README says it reports
+        run: |
+          set -euo pipefail
+          unbuilt examples/Dockerfile > out.txt && status=0 || status=$?
+          cat out.txt
+          test "$status" -eq 1
+          grep -qF 'Not built for this target: build, test.' out.txt
+          grep -qF '4 instructions with no effect on this build.' out.txt
+          for kind in unused-arg empty-expansion superseded \
+                      copy-from-unknown orphan-stage; do
+            grep -qF "$kind" out.txt
+          done
+
+      - name: a clean Dockerfile exits 0 and says so
+        run: |
+          set -euo pipefail
+          printf 'FROM alpine AS app\nENV A=1\nRUN use-it\n' > clean.Dockerfile
+          unbuilt clean.Dockerfile | tee clean.txt
+          grep -qF 'Every instruction has an effect on this build.' clean.txt
+
+      - name: --json is valid JSON with findings and notes apart
+        run: |
+          set -euo pipefail
+          unbuilt --json examples/Dockerfile > out.json || true
+          python3 -c "
+          import json, sys
+          d = json.load(open('out.json'))
+          assert len(d['findings']) == 4, d['findings']
+          assert [n['kind'] for n in d['notes']] == ['orphan-stage'], d['notes']
+          assert d['target'] == 'runtime' and d['not_built'] == ['build', 'test']
+          print('json ok')
+          "
