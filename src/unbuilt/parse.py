@@ -48,7 +48,17 @@ class Instruction:
     """The joined source, flags included. What a reader would quote back."""
 
     heredocs: tuple[str, ...] = ()
-    """Bodies of any heredocs attached to this instruction."""
+    """Bodies of heredocs whose tag was unquoted, so the builder expands them.
+
+    A quoted tag -- `<<"EOF"` or `<<'EOF'` -- suppresses expansion, exactly as
+    in a shell, and the body is kept out of here because of it. Most of what a
+    real Dockerfile puts in a heredoc is a shell script full of `${...}` meant
+    for run time; scanning those gave thirteen false findings on airflow's
+    Dockerfile, every one of them a quoted heredoc.
+    """
+
+    raw_heredocs: tuple[tuple[str, bool], ...] = ()
+    """Every heredoc body with its quoted flag, for anything that wants both."""
 
 
 @dataclass
@@ -58,7 +68,9 @@ class Parsed:
     escape: str = DEFAULT_ESCAPE
 
 
-def _logical_lines(lines: list[str], escape: str) -> list[tuple[int, str, list[str]]]:
+def _logical_lines(
+    lines: list[str], escape: str
+) -> list[tuple[int, str, list[tuple[str, bool]]]]:
     """Join continuations. Returns (line number, joined text, heredoc bodies).
 
     Comment lines inside a continuation are dropped, which is what the builder
@@ -93,9 +105,10 @@ def _logical_lines(lines: list[str], escape: str) -> list[tuple[int, str, list[s
         joined = " ".join(p for p in parts if p)
 
         # Consume any heredoc bodies this instruction opened, in order.
-        bodies: list[str] = []
+        bodies: list[tuple[str, bool]] = []
         for match in _HEREDOC.finditer(joined):
             tag = match.group("tag")
+            quoted = bool(match.group("quote"))
             body: list[str] = []
             while i < len(lines):
                 if lines[i].strip() == tag:
@@ -103,7 +116,7 @@ def _logical_lines(lines: list[str], escape: str) -> list[tuple[int, str, list[s
                     break
                 body.append(lines[i].rstrip("\n"))
                 i += 1
-            bodies.append("\n".join(body))
+            bodies.append(("\n".join(body), quoted))
 
         out.append((start + 1, joined, bodies))
     return out
@@ -151,7 +164,8 @@ def parse(text: str) -> Parsed:
                 flags=flags,
                 line=number,
                 raw=joined,
-                heredocs=tuple(bodies),
+                heredocs=tuple(body for body, quoted in bodies if not quoted),
+                raw_heredocs=tuple(bodies),
             )
         )
 

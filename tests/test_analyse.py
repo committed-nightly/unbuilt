@@ -115,6 +115,72 @@ def test_env_a_later_copy_only_uses_if_it_names_a_variable():
     assert at(unused, 2) == ["discarded-setting"]
 
 
+def test_an_env_any_later_instruction_names_is_not_discarded():
+    # grafana's Dockerfile, reduced: the ENV is read by the WORKDIR under it.
+    # An earlier version only looked at RUN/COPY/ADD and called this dead.
+    text = (
+        "FROM alpine AS assets\nENV GF_PATHS_HOME=/usr/share/grafana\n"
+        "WORKDIR $GF_PATHS_HOME\nCOPY x ./bin/\n"
+        "FROM alpine AS f\nCOPY --from=assets /usr/share/grafana /g\n"
+    )
+    assert at(text, 2) == []
+
+
+def test_an_env_read_only_by_a_metadata_instruction_still_counts():
+    text = (
+        "FROM alpine AS b\nENV PORT=8080\nEXPOSE ${PORT}\n"
+        "FROM alpine AS f\nCOPY --from=b /x /x\n"
+    )
+    # EXPOSE itself is discarded here, but it does read PORT, so PORT is not.
+    assert at(text, 2) == []
+    assert at(text, 3) == ["discarded-metadata"]
+
+
+def test_an_env_a_descendant_stage_reads_is_not_discarded():
+    # n8n's Dockerfile, reduced: `toolchain` sets NODE_GYP and the stage built
+    # FROM it runs `node "$NODE_GYP"`. Looking only inside the one stage calls
+    # that dead.
+    text = (
+        "FROM alpine AS toolchain\nENV NODE_GYP=/usr/bin/node-gyp\n"
+        "FROM toolchain AS native\nRUN node \"$NODE_GYP\" rebuild\n"
+        "FROM alpine AS f\nCOPY --from=native /build /build\n"
+    )
+    assert at(text, 2) == []
+
+
+def test_any_run_downstream_is_enough_to_keep_an_env():
+    # Deliberately conservative, and the reason is not fixable: a RUN gets
+    # every ARG and ENV in its environment, so the program it invokes can read
+    # UNUSED_FLAG without the Dockerfile naming it. unbuilt cannot see inside
+    # `make`, so it does not claim the line is dead.
+    text = (
+        "FROM alpine AS toolchain\nENV UNUSED_FLAG=1\n"
+        "FROM toolchain AS native\nRUN make\n"
+        "FROM alpine AS f\nCOPY --from=native /build /build\n"
+    )
+    assert at(text, 2) == []
+
+
+def test_an_env_with_no_run_anywhere_downstream_is_discarded():
+    text = (
+        "FROM alpine AS toolchain\nENV UNUSED_FLAG=1\n"
+        "FROM toolchain AS native\nCOPY in /out\n"
+        "FROM alpine AS f\nCOPY --from=native /out /out\n"
+    )
+    assert at(text, 2) == ["discarded-setting"]
+
+
+def test_a_workdir_whose_stage_has_no_descendants_and_no_build_steps():
+    # outline's Dockerfile, reduced: `base` is an ARG and a WORKDIR, nothing
+    # is built FROM it, and every COPY --from=base uses an absolute path.
+    text = (
+        "ARG APP_PATH=/opt/app\nFROM scratch AS base\nARG APP_PATH\n"
+        "WORKDIR $APP_PATH\n"
+        "FROM alpine AS runner\nCOPY --from=base /opt/app/build ./build\n"
+    )
+    assert at(text, 4) == ["discarded-setting"]
+
+
 def test_workdir_before_a_build_step_is_never_reported():
     # WORKDIR changes where a COPY lands, variables or not.
     text = (
@@ -264,10 +330,26 @@ def test_an_arg_a_run_mentions_is_used():
     assert kinds("FROM alpine AS f\nARG TOKEN\nRUN echo $TOKEN\n") == []
 
 
-def test_an_unused_arg_is_reported_wherever_it_is_declared():
-    # Target-independent: no build of this file ever reads UNUSED.
-    text = "FROM alpine AS lonely\nARG UNUSED\nRUN x\nFROM alpine AS f\nRUN true\n"
-    assert kinds(text) == ["unused-arg"]
+def test_a_stage_arg_with_a_run_below_it_is_left_alone():
+    # The RUN gets NAME in its environment, so the program it invokes can read
+    # it with nothing in the Dockerfile naming it. buildkit's own
+    # `ARG CGO_ENABLED=0` works precisely this way.
+    assert kinds("FROM alpine AS f\nARG CGO_ENABLED=0\nRUN go build\n") == []
+
+
+def test_a_stage_arg_with_no_run_below_it_is_reported():
+    assert kinds("FROM alpine AS f\nRUN go build\nARG LATE=1\n") == ["unused-arg"]
+
+
+def test_a_global_arg_is_judged_without_the_run_let_off():
+    # Globals are injected into no stage's environment, so a RUN cannot be
+    # quietly reading one.
+    assert kinds("ARG UNUSED\nFROM alpine AS f\nRUN go build\n") == ["unused-arg"]
+
+
+def test_build_args_buildkit_reads_for_itself_are_not_unused():
+    text = "FROM alpine AS f\nARG BUILDKIT_SBOM_SCAN_STAGE=true\n"
+    assert kinds(text) == []
 
 
 # --- shape of the result ---------------------------------------------------

@@ -148,6 +148,26 @@ def from_chain(all_stages: list[Stage], stage: Stage) -> list[Stage]:
     return chain
 
 
+def descendants(all_stages: list[Stage], stage: Stage) -> list[Stage]:
+    """Stages built `FROM` this one, transitively.
+
+    These inherit its `ENV`, `WORKDIR`, `USER` and `SHELL`, so their build
+    steps can read a value set here. n8n's `toolchain` stage sets
+    `ENV NODE_GYP=...` and three stages below it run `node "$NODE_GYP"`.
+    """
+    found: list[Stage] = []
+    queue = [stage]
+    while queue:
+        current = queue.pop()
+        for candidate in all_stages:
+            if candidate.index <= current.index or candidate in found:
+                continue
+            if candidate.base.lower() == (current.name or ""):
+                found.append(candidate)
+                queue.append(candidate)
+    return found
+
+
 def build(instructions: list[Instruction], target: str | None = None) -> Graph:
     """Work out what a `docker build` of this file would and would not run."""
     stages = _split_stages(instructions)

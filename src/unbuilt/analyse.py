@@ -20,6 +20,26 @@ from .parse import Instruction, parse
 #: able to have observed it.
 SINGLE_VALUED = ("ENTRYPOINT", "CMD", "HEALTHCHECK", "STOPSIGNAL")
 
+#: Build args BuildKit reads for itself. Declaring one is the whole point --
+#: `ARG BUILDKIT_SBOM_SCAN_STAGE=true` turns on SBOM scanning for the stage
+#: and is referenced by nothing, which an earlier version of this check
+#: reported as dead in buildkit's own Dockerfile, two lines under a comment
+#: saying what it does.
+RESERVED_ARGS = frozenset(
+    {
+        "BUILDKIT_SBOM_SCAN_STAGE",
+        "BUILDKIT_SBOM_SCAN_CONTEXT",
+        "BUILDKIT_SYNTAX",
+        "BUILDKIT_CACHE_MOUNT_NS",
+        "BUILDKIT_CONTEXT_KEEP_GIT_DIR",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "FTP_PROXY",
+        "NO_PROXY",
+        "ALL_PROXY",
+    }
+)
+
 
 @dataclass(frozen=True)
 class Finding:
@@ -104,19 +124,22 @@ def _could_consume(setting: Instruction, later: Instruction) -> bool:
     """Could `later` read the value `setting` establishes?
 
     `USER`, `WORKDIR` and `SHELL` change how any build step behaves -- what a
-    `COPY` lands as, where it lands, what shell a `RUN` uses -- so any of them
-    counts. `ENV` is different: a `RUN` always has it in the environment, but a
-    `COPY` or `ADD` only reads it if the path actually names a variable. That
-    distinction is the whole reason unbuilt can call out an `ENV` in a builder
-    stage, which is the mistake this check was written for.
+    `COPY` lands as, where it lands, what shell a `RUN` uses -- so a build
+    step below one of those counts, variables or not.
+
+    `ENV` is read by name, so it is checked by name, and against *every* later
+    instruction rather than just the build steps. Checking only build steps is
+    how an earlier version decided grafana's `ENV GF_PATHS_HOME` was dead with
+    `WORKDIR $GF_PATHS_HOME` on the line directly below it. A `RUN` always
+    counts, because there the value is in the shell's environment whether or
+    not anything spells it out.
     """
-    if later.keyword not in stages_module.BUILD_STEPS:
-        return False
     if setting.keyword != "ENV":
-        return True
+        return later.keyword in stages_module.BUILD_STEPS
     if later.keyword == "RUN":
         return True
-    return bool(vars_module.references(later))
+    names = set(vars_module.assignments(setting.argument))
+    return any(r.name in names for r in vars_module.references(later))
 
 
 def _discarded_config(graph: stages_module.Graph) -> list[Finding]:
@@ -143,9 +166,15 @@ def _discarded_config(graph: stages_module.Graph) -> list[Finding]:
                     )
                 )
             elif instruction.keyword in ("ENV", "USER", "WORKDIR", "SHELL"):
-                later = stage.instructions[position + 1 :]
+                # Below it in this stage, and anywhere in a stage built FROM
+                # this one -- those inherit the value and can read it. Looking
+                # only at this stage called n8n's NODE_GYP dead with three
+                # `node "$NODE_GYP"` lines in stages below it.
+                later = list(stage.instructions[position + 1 :])
+                for child in stages_module.descendants(graph.stages, stage):
+                    later.extend(child.instructions)
                 if any(_could_consume(instruction, i) for i in later):
-                    continue  # A later build step in this stage could use it.
+                    continue
                 findings.append(
                     Finding(
                         kind="discarded-setting",
@@ -302,21 +331,57 @@ def _copy_sources(graph: stages_module.Graph) -> list[Finding]:
 def _unused_args(
     instructions: list[Instruction], graph: stages_module.Graph
 ) -> list[Finding]:
+    """ARGs no build of this file can read.
+
+    The trap here cost a rewrite. A stage-level `ARG NAME` is exported into
+    the environment of every `RUN` below it, so the program the `RUN` invokes
+    can read it with `$NAME` appearing nowhere in the Dockerfile --
+    buildkit's own `ARG CGO_ENABLED=0` configures `go build` exactly that
+    way. So a stage `ARG` is only provably unused with no `RUN` beneath it.
+
+    A global `ARG` is injected into no stage's environment, so for those the
+    plain "nothing references it" answer holds.
+    """
     used: set[str] = set()
     for instruction in instructions:
         for reference in vars_module.references(instruction):
             used.add(reference.name)
 
+    # A bare `ARG NAME` inside a stage is a declaration, not a reference, but
+    # it is what pulls a global's value -- and so any --build-arg for it --
+    # into that stage. airflow declares AIRFLOW_IMAGE_README_URL globally and
+    # re-declares it 2000 lines later, and that counts as using it.
+    redeclared: set[str] = set()
+    for stage in graph.stages:
+        redeclared |= vars_module.names_in_stage(stage)
+
     findings = []
     for instruction in instructions:
         if instruction.keyword != "ARG":
             continue
-        owner = next(
-            (s for s in graph.stages if instruction in s.instructions),
-            None,
-        )
+        owner = next((s for s in graph.stages if instruction in s.instructions), None)
+
+        if owner is None:
+            if any(
+                name in redeclared
+                for name in vars_module.assignments(instruction.argument)
+            ):
+                continue
+            reason = (
+                "is declared before the first FROM and referenced nowhere -- not "
+                "in a FROM line, and not by any stage that re-declares it"
+            )
+        else:
+            position = owner.instructions.index(instruction)
+            if any(i.keyword == "RUN" for i in owner.instructions[position + 1 :]):
+                continue  # A RUN below it gets the value in its environment.
+            reason = (
+                "is declared, referenced nowhere, and has no RUN below it in this "
+                "stage to pick it up out of the environment"
+            )
+
         for name in vars_module.assignments(instruction.argument):
-            if name in used:
+            if name in used or name.upper() in RESERVED_ARGS:
                 continue
             findings.append(
                 Finding(
@@ -324,8 +389,8 @@ def _unused_args(
                     line=instruction.line,
                     stage=owner.label if owner else "before the first FROM",
                     detail=(
-                        f"{name} is declared and never referenced, so passing "
-                        f"--build-arg {name}=... changes nothing"
+                        f"{name} {reason}, so passing --build-arg {name}=... "
+                        f"changes nothing"
                     ),
                     instruction=_truncate(instruction.raw),
                 )
