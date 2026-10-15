@@ -37,7 +37,18 @@ class Finding:
 class Result:
     target: str | None
     stage_count: int
+
     findings: list[Finding] = field(default_factory=list)
+    """Instructions with no effect. These set the exit code."""
+
+    notes: list[Finding] = field(default_factory=list)
+    """True, and not necessarily a problem, so they do not fail anything.
+
+    An orphan stage lives here. Whether it is dead depends on whether some CI
+    job passes `--target`, and that is not in the Dockerfile. unbuilt will not
+    guess and then exit non-zero about the guess.
+    """
+
     errors: list[str] = field(default_factory=list)
     skipped_stages: list[str] = field(default_factory=list)
 
@@ -51,21 +62,37 @@ def _truncate(text: str, width: int = 68) -> str:
     return collapsed if len(collapsed) <= width else collapsed[: width - 1] + "…"
 
 
-def _unreachable_stages(graph: stages_module.Graph) -> list[Finding]:
+def _orphan_stages(graph: stages_module.Graph) -> list[Finding]:
+    """Stages nothing in the file refers to.
+
+    Deliberately *not* "every stage this target does not need". Plenty of
+    Dockerfiles are written as a library of stages that CI builds one at a
+    time with `--target`, and telling someone that 20 of their 23 stages are
+    unused because you happened to pick the last one is noise. A stage no
+    other stage names is a different claim: unless you ask for it by name, it
+    is never built by anything, and in a file where every other stage is
+    wired up that is usually a rename somebody half-finished.
+    """
     findings = []
     for stage in graph.stages:
-        if stage.index in graph.built:
+        if stage.index in graph.referenced:
             continue
+        if graph.target is not None and stage.index == graph.target.index:
+            continue
+        if not stage.instructions:
+            continue  # An alias stage, e.g. `FROM alpine AS base`. Nothing lost.
         count = len(stage.instructions)
         body = f"{count} instruction{'s' if count != 1 else ''}"
+        named = f"--target {stage.name}" if stage.name else "--target"
         findings.append(
             Finding(
-                kind="unreachable-stage",
+                kind="orphan-stage",
                 line=stage.line,
                 stage=stage.label,
                 detail=(
-                    f"nothing the target needs comes from this stage, so BuildKit "
-                    f"skips it and its {body} never run"
+                    f"no other stage builds FROM this one or copies out of it, so "
+                    f"BuildKit only runs its {body} if you ask for it by name with "
+                    f"{named}"
                 ),
                 instruction=_truncate(f"FROM {stage.base}"),
             )
@@ -139,8 +166,8 @@ def _superseded(graph: stages_module.Graph) -> list[Finding]:
     """Settings a later line in the same stage replaces before anything reads."""
     findings = []
     for stage in graph.stages:
-        if stage.index not in graph.built:
-            continue  # Already reported whole, as unreachable.
+        if not stage.instructions:
+            continue
 
         for keyword in SINGLE_VALUED:
             matching = [i for i in stage.instructions if i.keyword == keyword]
@@ -197,8 +224,8 @@ def _expansions(
     """References that expand to the empty string."""
     findings = []
     for stage in graph.stages:
-        if stage.index not in graph.built:
-            continue
+        # Every stage, built or not: an empty expansion is empty whichever
+        # target you pick.
         chain = stages_module.from_chain(graph.stages, stage)
         inherited = vars_module.inherited_names(stage, chain)
 
@@ -244,8 +271,7 @@ def _copy_sources(graph: stages_module.Graph) -> list[Finding]:
     findings = []
     names = [s.name for s in graph.stages if s.name]
     for stage in graph.stages:
-        if stage.index not in graph.built:
-            continue
+        # Target-independent: the reference is wrong in any build.
         for instruction in stage.instructions:
             if instruction.keyword not in ("COPY", "ADD"):
                 continue
@@ -289,8 +315,6 @@ def _unused_args(
             (s for s in graph.stages if instruction in s.instructions),
             None,
         )
-        if owner is not None and owner.index not in graph.built:
-            continue  # The whole stage is already reported.
         for name in vars_module.assignments(instruction.argument):
             if name in used:
                 continue
@@ -328,13 +352,14 @@ def run(text: str, target: str | None = None, strict: bool = False) -> Result:
         )
 
     globals_ = vars_module.declared_globals(parsed.instructions)
-    result.findings.extend(_unreachable_stages(graph))
+    result.notes.extend(_orphan_stages(graph))
     result.findings.extend(_discarded_config(graph))
     result.findings.extend(_superseded(graph))
     result.findings.extend(_expansions(graph, globals_, strict))
     result.findings.extend(_copy_sources(graph))
     result.findings.extend(_unused_args(parsed.instructions, graph))
     result.findings.sort(key=lambda f: (f.line, f.kind))
+    result.notes.sort(key=lambda f: (f.line, f.kind))
     result.skipped_stages = [
         s.label for s in graph.stages if s.index not in graph.built
     ]

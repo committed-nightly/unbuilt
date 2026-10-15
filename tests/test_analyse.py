@@ -13,31 +13,63 @@ def kinds(text: str, **kwargs) -> list[str]:
     return [f.kind for f in analyse.run(text, **kwargs).findings]
 
 
+def notes(text: str, **kwargs) -> list[str]:
+    return [f.kind for f in analyse.run(text, **kwargs).notes]
+
+
 def at(text: str, line: int, **kwargs) -> list[str]:
     return [f.kind for f in analyse.run(text, **kwargs).findings if f.line == line]
 
 
-# --- unreachable stages ----------------------------------------------------
+# --- orphan stages ---------------------------------------------------------
+#
+# An orphan is a note, not a finding: whether it is dead depends on whether
+# some CI job names it with --target, which is not in the file.
 
 
-def test_a_stage_nothing_needs_is_reported_once():
-    text = "FROM alpine AS dead\nRUN a\nRUN b\nFROM alpine AS final\nRUN c\n"
-    assert kinds(text) == ["unreachable-stage"]
-    assert "2 instructions never run" in analyse.run(text).findings[0].detail
+def test_a_stage_nothing_refers_to_is_a_note_not_a_finding():
+    text = "FROM alpine AS lonely\nRUN a\nRUN b\nFROM alpine AS final\nRUN c\n"
+    assert kinds(text) == []
+    assert notes(text) == ["orphan-stage"]
+    assert "--target lonely" in analyse.run(text).notes[0].detail
 
 
-def test_a_stage_copied_from_is_not_unreachable():
+def test_a_stage_copied_from_is_not_an_orphan():
     text = "FROM alpine AS src\nRUN a\nFROM alpine AS final\nCOPY --from=src /a /a\n"
-    assert "unreachable-stage" not in kinds(text)
+    assert notes(text) == []
 
 
-def test_a_base_of_the_target_is_not_unreachable():
-    assert "unreachable-stage" not in kinds("FROM alpine AS base\nRUN a\nFROM base AS f\n")
+def test_a_base_of_another_stage_is_not_an_orphan():
+    assert notes("FROM alpine AS base\nRUN a\nFROM base AS f\nRUN b\n") == []
 
 
-def test_targeting_a_stage_makes_the_later_ones_unreachable():
+def test_the_target_itself_is_never_an_orphan():
+    assert notes("FROM alpine AS only\nRUN a\n") == []
+
+
+def test_an_alias_stage_with_no_instructions_is_not_worth_mentioning():
+    # `FROM alpine AS base` with nothing in it is how stage-library
+    # Dockerfiles name their inputs. There is nothing in it to be dead.
+    assert notes("FROM alpine AS base\nFROM alpine AS final\nRUN a\n") == []
+
+
+def test_a_stage_referenced_only_by_an_orphan_is_still_not_an_orphan():
+    # The chain is real even if nothing asks for its end. Saying otherwise
+    # would cascade one note into a report about half the file.
+    text = (
+        "FROM alpine AS build\nRUN a\n"
+        "FROM alpine AS test\nCOPY --from=build /a /a\n"
+        "FROM alpine AS final\nRUN b\n"
+    )
+    assert notes(text) == ["orphan-stage"]
+    assert analyse.run(text).notes[0].stage == "test"
+    assert analyse.run(text).skipped_stages == ["build", "test"]
+
+
+def test_targeting_an_earlier_stage_does_not_turn_later_ones_into_findings():
     text = "FROM alpine AS one\nRUN a\nFROM alpine AS two\nRUN b\n"
-    assert kinds(text, target="one") == ["unreachable-stage"]
+    assert kinds(text, target="one") == []
+    assert analyse.run(text, target="one").skipped_stages == ["two"]
 
 
 # --- configuration that does not reach the image ---------------------------
@@ -97,9 +129,12 @@ def test_metadata_in_the_targets_own_lineage_is_kept():
     assert kinds(text) == []
 
 
-def test_metadata_in_an_unreachable_stage_is_not_reported_twice():
-    text = "FROM alpine AS dead\nEXPOSE 80\nENTRYPOINT [\"/x\"]\nFROM alpine AS f\n"
-    assert kinds(text) == ["unreachable-stage"]
+def test_discarded_config_is_only_claimed_about_stages_this_target_builds():
+    # `lonely` is not built for this target, so unbuilt makes no claim about
+    # what its EXPOSE reaches -- `--target lonely` and it reaches the image.
+    text = "FROM alpine AS lonely\nEXPOSE 80\nENTRYPOINT [\"/x\"]\nFROM alpine AS f\nRUN a\n"
+    assert kinds(text) == []
+    assert kinds(text, target="lonely") == []
 
 
 # --- ARG scope -------------------------------------------------------------
@@ -229,9 +264,10 @@ def test_an_arg_a_run_mentions_is_used():
     assert kinds("FROM alpine AS f\nARG TOKEN\nRUN echo $TOKEN\n") == []
 
 
-def test_an_arg_in_an_unreachable_stage_is_only_reported_as_the_stage():
-    text = "FROM alpine AS dead\nARG UNUSED\nFROM alpine AS f\nRUN true\n"
-    assert kinds(text) == ["unreachable-stage"]
+def test_an_unused_arg_is_reported_wherever_it_is_declared():
+    # Target-independent: no build of this file ever reads UNUSED.
+    text = "FROM alpine AS lonely\nARG UNUSED\nRUN x\nFROM alpine AS f\nRUN true\n"
+    assert kinds(text) == ["unused-arg"]
 
 
 # --- shape of the result ---------------------------------------------------
@@ -239,10 +275,11 @@ def test_an_arg_in_an_unreachable_stage_is_only_reported_as_the_stage():
 
 def test_findings_come_out_in_line_order():
     text = (
-        "ARG UNUSED\nFROM alpine AS dead\nRUN a\n"
-        "FROM alpine AS f\nENV P=1\nENV P=2\n"
+        "ARG UNUSED\nFROM alpine AS f\nENV P=1\nENV P=2\n"
+        "ENTRYPOINT [\"/a\"]\nENTRYPOINT [\"/b\"]\n"
     )
     lines = [f.line for f in analyse.run(text).findings]
+    assert len(lines) == 3
     assert lines == sorted(lines)
 
 
@@ -256,6 +293,27 @@ def test_an_unknown_target_is_an_error_and_analysis_still_happens():
     result = analyse.run("FROM alpine AS f\nENV P=1\nENV P=2\n", target="nope")
     assert any("no stage named nope" in e for e in result.errors)
     assert [f.kind for f in result.findings] == ["superseded"]
+
+
+def test_a_stage_library_dockerfile_is_quiet():
+    """The shape that drove the design: many stages, built one at a time.
+
+    grafana's and buildkit's Dockerfiles look like this. An earlier version
+    reported every stage the default target did not need, which was 20-odd
+    findings per file and all of them useless. Nothing here is a finding; the
+    per-platform entry points are notes.
+    """
+    text = (
+        "ARG GO=1.23\n"
+        "FROM golang:${GO} AS build-base\nRUN apk add git\n"
+        "FROM build-base AS build\nCOPY . .\nRUN go build -o /out/app\n"
+        "FROM alpine AS release-linux\nCOPY --from=build /out/app /app\n"
+        "FROM alpine AS release-windows\nCOPY --from=build /out/app /app.exe\n"
+        "FROM release-linux AS final\nENTRYPOINT [\"/app\"]\n"
+    )
+    result = analyse.run(text)
+    assert result.findings == []
+    assert [f.stage for f in result.notes] == ["release-windows"]
 
 
 def test_a_clean_dockerfile_reports_nothing():

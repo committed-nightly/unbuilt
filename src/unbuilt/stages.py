@@ -69,6 +69,15 @@ class Graph:
     unknown_target: str | None = None
     """Set when --target named a stage that does not exist."""
 
+    referenced: set[int] = field(default_factory=set)
+    """Stages some other stage names, by `FROM` or by `--from`.
+
+    A stage outside this set is only ever built if you name it with `--target`.
+    That is different from "not built for this target", which in a Dockerfile
+    written as a library of stages is true of nearly all of them and worth
+    saying about none of them.
+    """
+
     def by_ref(self, ref: str) -> Stage | None:
         """Resolve a stage reference the way the builder does: name, or index."""
         lowered = ref.lower()
@@ -181,10 +190,18 @@ def build(instructions: list[Instruction], target: str | None = None) -> Graph:
             queue.append(parent.index)
         queue.extend(dependencies(stage, stages))
 
+    referenced: set[int] = set()
+    for stage in stages:
+        parent = by_name.get(stage.base.lower())
+        if parent is not None and parent.index < stage.index:
+            referenced.add(parent.index)
+        referenced |= dependencies(stage, stages)
+
     return Graph(
         stages=stages,
         target=chosen,
         built=built,
         lineage=lineage,
         unknown_target=unknown_target,
+        referenced=referenced,
     )

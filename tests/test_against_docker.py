@@ -98,9 +98,11 @@ def test_an_unreachable_stage_is_never_run(build):
     assert not targeted_ok
     assert "no-such-file.txt" in targeted_output
 
-    # ...and unbuilt says so, about that stage, without being asked.
-    findings = analyse.run(SKIPPED).findings
-    assert [(f.kind, f.stage) for f in findings] == [("unreachable-stage", "dead")]
+    # ...and unbuilt names that stage as one the default build leaves out.
+    result = analyse.run(SKIPPED)
+    assert result.skipped_stages == ["dead"]
+    assert [(f.kind, f.stage) for f in result.notes] == [("orphan-stage", "dead")]
+    assert result.findings == []  # a --target away from being alive, so not a failure
 
 
 @needs_docker
