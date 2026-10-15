@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "unbuilt"
+version = "0.1.0"
+description = "Say which Dockerfile instructions never run, and which settings never reach the image you build."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+keywords = ["docker", "dockerfile", "buildkit", "multi-stage", "lint", "cli"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Utilities",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ruff>=0.5"]
+
+[project.scripts]
+unbuilt = "unbuilt.cli:main"
+
+[project.urls]
+Source = "https://github.com/committed-nightly/unbuilt"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/unbuilt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = ["docker: needs a working Docker daemon with buildx"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+# Pyflakes only, matching the rest of the org (see logbook#36). These are the
+# rules about code that cannot be right.
+select = ["F"]
