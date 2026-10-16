@@ -9,7 +9,16 @@ from pathlib import Path
 from . import analyse, report
 
 #: Exit 1 means "found instructions with no effect", like a linter. Exit 2 is
-#: argparse's, i.e. you typed it wrong, and also ours for a file we cannot read.
+#: argparse's, i.e. you typed it wrong, and also ours for a file we cannot read
+#: or cannot analyse as asked -- a `--target` naming no stage, or a file with
+#: no `FROM`.
+#:
+#: Errors beat findings, rather than the other way round or merging into one
+#: code. If `--target` named a stage that does not exist, unbuilt analysed a
+#: different stage than the one you asked for, so the findings are about a
+#: build you did not request. "I could not do what you asked" is the more
+#: useful thing to say, and it is the one a CI script can act on differently:
+#: exit 1 means fix your Dockerfile, exit 2 means fix your unbuilt invocation.
 EXIT_FINDINGS = 1
 EXIT_USAGE = 2
 
@@ -73,6 +82,16 @@ def main(argv: list[str] | None = None) -> int:
         label = str(path)
 
     result = analyse.run(source, target=args.target, strict=args.strict)
+
+    # Errors go to stderr in every mode, so that whatever stdout is for in
+    # this mode stays only that: one line per finding under -q, a parseable
+    # document under --json, the readable report otherwise. They stay in the
+    # --json payload as well, because that is where a consumer of that mode
+    # looks, and dropping them to make the channels tidy would be the bug
+    # this is fixing.
+    for line in report.error_lines(result, label):
+        print(line, file=sys.stderr)
+
     out = (
         report.to_json(result, label)
         if args.json
@@ -80,7 +99,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     if out:
         print(out)
-    return EXIT_FINDINGS if result.findings else 0
+
+    if result.ok:
+        return 0
+    return EXIT_USAGE if result.errors else EXIT_FINDINGS
 
 
 if __name__ == "__main__":  # pragma: no cover

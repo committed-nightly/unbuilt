@@ -20,6 +20,7 @@ import uuid
 import pytest
 
 from unbuilt import analyse
+from unbuilt.cli import main
 
 pytestmark = pytest.mark.docker
 
@@ -214,6 +215,36 @@ def test_the_last_env_wins_and_unbuilt_blames_the_first(build):
 
     findings = analyse.run(text).findings
     assert [(f.kind, f.line) for f in findings] == [("superseded", 2)]
+
+
+@needs_docker
+def test_docker_refuses_an_unknown_target_so_unbuilt_must_not_report_success(
+    build, tmp_path
+):
+    """The parity that sent this PR back, stated against the real builder.
+
+    `docker build --target no-such-stage` does not fall back to another stage;
+    it refuses to build anything and exits non-zero. unbuilt analyses the last
+    stage instead and says so, which is a useful thing to do -- but it was
+    then exiting 0, i.e. reporting a clean build of a build that Docker will
+    not perform at all.
+    """
+    text = "FROM scratch AS final\nCOPY payload.txt /payload\n"
+    ok, output, _ = build(text, "--target", "no-such-stage")
+    assert not ok
+    assert "no-such-stage" in output
+
+    # Same file, same flag, no finding anywhere in it -- and still not a
+    # success, because unbuilt could not analyse what was asked for.
+    result = analyse.run(text, target="no-such-stage")
+    assert result.findings == []
+    assert not result.ok
+    assert result.errors == [
+        "no stage named no-such-stage; analysed the last stage (final) instead"
+    ]
+
+    (tmp_path / "Dockerfile").write_text(text)
+    assert main([str(tmp_path / "Dockerfile"), "--target", "no-such-stage"]) != 0
 
 
 @needs_docker

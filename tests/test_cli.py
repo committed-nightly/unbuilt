@@ -114,11 +114,66 @@ def test_an_unreadable_dockerfile_does_not_traceback(dockerfile):
         path.chmod(0o644)
 
 
-def test_a_file_with_no_from_reports_the_error_and_exits_zero(dockerfile, capsys):
-    # Nothing was found to be dead, so this is not a findings exit. The error
-    # still gets printed.
-    assert main([str(dockerfile("RUN true\n"))]) == 0
-    assert "builds nothing" in capsys.readouterr().out
+def test_a_file_with_no_from_exits_two_and_claims_nothing_on_stdout(
+    dockerfile, capsys
+):
+    # It builds nothing, so there is no report to give. An earlier version
+    # printed "0 stages, building None" followed by "every instruction has an
+    # effect on this build" -- two false claims -- and exited 0.
+    assert main([str(dockerfile("RUN true\n"))]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "builds nothing" in captured.err
+
+
+# A `--target` that names no stage is the case that sent this PR back: unbuilt
+# analyses a different stage than the one asked for, so every number below is
+# about a build nobody requested. It has to be loud in all three modes.
+TYPO = ["--target", "no-such-stage"]
+
+
+def test_an_unknown_target_exits_two_not_zero(dockerfile, capsys):
+    assert main([str(dockerfile(CLEAN)), *TYPO]) == 2
+    assert "no stage named no-such-stage" in capsys.readouterr().err
+
+
+def test_an_unknown_target_is_not_silent_under_quiet(dockerfile, capsys):
+    # The regression in full: -q is the mode documented for piping into CI,
+    # and it was the one mode that printed nothing at all and exited 0.
+    assert main([str(dockerfile(CLEAN)), *TYPO, "-q"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "no stage named no-such-stage" in captured.err
+
+
+def test_an_unknown_target_under_json_keeps_stdout_parseable(dockerfile, capsys):
+    assert main([str(dockerfile(CLEAN)), *TYPO, "--json"]) == 2
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["errors"] == [
+        "no stage named no-such-stage; analysed the last stage (f) instead"
+    ]
+    assert "no stage named no-such-stage" in captured.err
+
+
+def test_an_error_outranks_a_finding_in_the_exit_code(dockerfile, capsys):
+    # DIRTY on its own is exit 1. With a target that does not exist, the
+    # finding is real but it is about a stage the caller did not ask for, so
+    # "I could not do what you asked" is the answer that gets the exit code.
+    assert main([str(dockerfile(DIRTY))]) == 1
+    capsys.readouterr()
+    assert main([str(dockerfile(DIRTY)), *TYPO]) == 2
+    captured = capsys.readouterr()
+    assert "superseded" in captured.out  # still reported, just not the verdict
+    assert "no stage named no-such-stage" in captured.err
+
+
+def test_a_real_target_is_still_quiet_on_stderr(dockerfile, capsys):
+    # The guard against making every --target noisy: a stage that exists
+    # produces no diagnostic at all.
+    path = dockerfile("FROM alpine AS one\nRUN a\nFROM alpine AS two\nRUN b\n")
+    assert main([str(path), "--target", "one"]) == 0
+    assert capsys.readouterr().err == ""
 
 
 #: The Dockerfile at the top of the README, verbatim. The block under it is
