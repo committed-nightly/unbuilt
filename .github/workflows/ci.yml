@@ -71,6 +71,66 @@ jobs:
           unbuilt clean.Dockerfile | tee clean.txt
           grep -qF 'Every instruction has an effect on this build.' clean.txt
 
+      # The README's "When --target names no stage" section, asserted on the
+      # channel it is about: a typo must not be able to reach stdout-only
+      # consumers as silence and a zero exit.
+      - name: a --target that names no stage exits 2 and says so on stderr
+        run: |
+          set -euo pipefail
+          run_typo() {  # "$@" = extra flags; sets $status, writes out/err.txt
+            unbuilt examples/Dockerfile --target buidler "$@" \
+              >out.txt 2>err.txt && status=0 || status=$?
+          }
+
+          # Every mode: exit 2, and the diagnostic is on stderr.
+          for mode in default quiet json; do
+            case $mode in
+              default) run_typo ;;
+              quiet)   run_typo -q ;;
+              json)    run_typo --json ;;
+            esac
+            test "$status" -eq 2
+            grep -qF 'no stage named buidler' err.txt
+          done
+
+          # ...and it is *not* on stdout in the two modes whose stdout is for
+          # something else. --json is excluded on purpose: a consumer of that
+          # mode reads `errors` out of the document, so there it belongs.
+          # `! grep -q ...` would be the obvious spelling and it never fails:
+          # set -e is documented to ignore a pipeline whose return value is
+          # inverted with `!`, so the assertion passes whatever grep finds.
+          no_diagnostic_on_stdout() {
+            if grep -qF 'unbuilt: ' out.txt; then
+              echo "diagnostic reached stdout:" >&2
+              cat out.txt >&2
+              exit 1
+            fi
+          }
+
+          run_typo
+          no_diagnostic_on_stdout
+          run_typo -q
+          no_diagnostic_on_stdout
+          test "$(wc -l <out.txt)" -eq 4   # findings only, so wc -l still means it
+
+          run_typo --json
+          python3 -c "
+          import json
+          d = json.load(open('out.txt'))
+          assert d['errors'] == ['no stage named buidler; analysed the last stage (runtime) instead'], d['errors']
+          assert len(d['findings']) == 4, d['findings']
+          print('json carries the error and stays parseable')
+          "
+
+      - name: a file with no FROM exits 2 and claims nothing
+        run: |
+          set -euo pipefail
+          printf 'RUN true\n' > noform.Dockerfile
+          unbuilt noform.Dockerfile >out.txt 2>err.txt && status=0 || status=$?
+          test "$status" -eq 2
+          test ! -s out.txt
+          grep -qF 'builds nothing' err.txt
+
       - name: --json is valid JSON with findings and notes apart
         run: |
           set -euo pipefail

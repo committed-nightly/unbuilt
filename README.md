@@ -132,15 +132,59 @@ no `--build-arg` can reach, and a `test` stage nothing runs.
 |---|---|
 | `0` | nothing dead found |
 | `1` | findings |
-| `2` | you typed it wrong, or the file could not be read |
+| `2` | you typed it wrong: a file that could not be read, a `--target` naming no stage, or a file with no `FROM` |
 
 Findings set the exit code. **Notes do not.** An orphan stage is a note
 because whether it is dead depends on whether some CI job passes `--target`,
 and that is not in the Dockerfile. unbuilt will not guess and then fail your
 build over the guess.
 
+`1` and `2` are worth telling apart in a CI script: `1` means fix your
+Dockerfile, `2` means fix the way you called unbuilt. When both apply, `2`
+wins.
+
+Anything on **stderr** is unbuilt saying it could not analyse what you asked
+for. It is never a finding and never on stdout, so stdout is only ever the
+report, the one-line-per-finding list under `-q`, or the document under
+`--json`.
+
 `-q` prints one `path:line: kind: detail` per finding and nothing else, with
 notes left out entirely, which is the form to pipe somewhere.
+
+### When `--target` names no stage
+
+`docker build --target buidler` builds nothing at all — it refuses, and does
+not fall back to another stage. unbuilt does go on to analyse a stage,
+because a report on the default target is more use than no report, but it
+says so on stderr and exits `2`:
+
+```
+$ unbuilt --target buidler Dockerfile
+unbuilt: Dockerfile: no stage named buidler; analysed the last stage (runtime) instead
+Dockerfile: 2 stages, building runtime.
+Not built for this target: build.
+
+  line 8  superseded  (runtime)
+    ENV PORT=3000
+...
+$ echo $?
+2
+```
+
+Every number under that first line is about `runtime`, a build you did not
+ask for. That is what the exit code is for, and it matters most in the mode
+where the first line is the part you cannot see:
+
+```
+$ unbuilt --target buidler Dockerfile -q > findings.txt
+unbuilt: Dockerfile: no stage named buidler; analysed the last stage (runtime) instead
+$ echo $?
+2
+```
+
+`findings.txt` still holds nothing but findings, one per line, so `wc -l`
+still means what it meant. The diagnostic went to stderr and the exit code
+is the one that tells you not to trust the file.
 
 ### Checks
 
