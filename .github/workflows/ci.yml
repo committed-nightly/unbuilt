@@ -64,6 +64,57 @@ jobs:
             grep -qF "$kind" out.txt
           done
 
+      # The README's --context section. The example ships a .dockerignore
+      # whose `*lock*` line also catches package-lock.json, so the deps
+      # stage copies by name a file the builder is never sent.
+      - name: --context finds the dockerignored COPY the README quotes
+        run: |
+          set -euo pipefail
+          unbuilt examples/Dockerfile --context examples >ctx.txt && s=0 || s=$?
+          cat ctx.txt
+          test "$s" -eq 1
+          grep -qF '5 instructions with no effect on this build.' ctx.txt
+          grep -qF 'dockerignored-copy' ctx.txt
+          grep -qF '.dockerignore line 10 (*lock*)' ctx.txt
+
+          # Without --context the checks are off, and the count the rest of
+          # the README quotes is the one that must not move.
+          unbuilt examples/Dockerfile >plain.txt && s=0 || s=$?
+          test "$s" -eq 1
+          grep -qF '4 instructions with no effect on this build.' plain.txt
+          if grep -qF 'dockerignored-copy' plain.txt; then
+            echo 'the context check ran without --context' >&2
+            exit 1
+          fi
+
+      # The whole point of --context is that it must not fire on a correct
+      # build. `COPY . /app` beside an ignore file is the commonest pair of
+      # lines in the ecosystem and has to stay silent.
+      - name: a correct COPY beside a .dockerignore stays silent
+        run: |
+          set -euo pipefail
+          mkdir -p ctx/src ctx/node_modules
+          printf 'x\n' > ctx/src/app.js
+          printf 'x\n' > ctx/node_modules/junk.js
+          printf 'node_modules\n*.md\n' > ctx/.dockerignore
+          printf 'FROM alpine AS app\nCOPY . /app\nCOPY src/*.js /app/\nRUN go\n' \
+            > ctx/Dockerfile
+          unbuilt ctx/Dockerfile --context ctx | tee quiet.txt
+          grep -qF 'Every instruction has an effect on this build.' quiet.txt
+
+      - name: a .dockerignore docker rejects exits 2 and still reports the file
+        run: |
+          set -euo pipefail
+          printf 'f[.txt\n' > ctx/.dockerignore
+          unbuilt ctx/Dockerfile --context ctx >out.txt 2>err.txt && s=0 || s=$?
+          test "$s" -eq 2
+          grep -qF 'unterminated [' err.txt
+          grep -qF 'Every instruction has an effect on this build.' out.txt
+          if grep -qF 'unbuilt: ' out.txt; then
+            echo 'the diagnostic reached stdout' >&2
+            exit 1
+          fi
+
       - name: a clean Dockerfile exits 0 and says so
         run: |
           set -euo pipefail

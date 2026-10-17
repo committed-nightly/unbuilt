@@ -219,6 +219,16 @@ class TestVerdicts:
         )
         assert findings == []
 
+    @pytest.mark.parametrize("source", [".", "./", "/"])
+    def test_copying_the_whole_context_is_never_reported(self, tree, source):
+        """`COPY . /app` beside a `.dockerignore` is the commonest pair of
+        lines there is, and the context root is not a thing that goes missing.
+        """
+        findings, notes = self.analyse(
+            tree, "*.key\ndist\nsrc", f"FROM scratch\nCOPY {source} /app\n"
+        )
+        assert (findings, notes) == ([], [])
+
     def test_an_untouched_copy_is_silent(self, tree):
         findings, notes = self.analyse(
             tree, "*.key", "FROM scratch\nCOPY src/*.go /src/\n"

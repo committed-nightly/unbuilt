@@ -61,7 +61,9 @@ fetches an image by that name from the registry instead — and nothing refers
 to `build` any more, so that stage quietly stops being built at all.
 
 **unbuilt reads the Dockerfile. It does not build it and does not need a
-Docker daemon.** Everything it claims about what Docker does was measured
+Docker daemon.** Pass `--context` and it also reads the build context
+directory, to answer what `.dockerignore` removes; it still never runs a
+build. Everything it claims about what Docker does was measured
 against a real builder first, and the test suite re-measures it: see
 [tests/test_against_docker.py](tests/test_against_docker.py), which builds
 each fixture, inspects the resulting image, and fails if Docker disagrees
@@ -78,7 +80,7 @@ Python 3.10 or newer, no dependencies.
 ## Usage
 
 ```
-unbuilt [DOCKERFILE] [--target STAGE] [--strict] [--json] [-q]
+unbuilt [DOCKERFILE] [--target STAGE] [--context DIR] [--strict] [--json] [-q]
 ```
 
 `unbuilt` with no arguments reads `./Dockerfile`. A directory argument looks
@@ -132,7 +134,7 @@ no `--build-arg` can reach, and a `test` stage nothing runs.
 |---|---|
 | `0` | nothing dead found |
 | `1` | findings |
-| `2` | you typed it wrong: a file that could not be read, a `--target` naming no stage, or a file with no `FROM` |
+| `2` | you typed it wrong: a file that could not be read, a `--target` naming no stage, a file with no `FROM`, or a `--context` that is not a directory or holds a `.dockerignore` Docker would reject |
 
 Findings set the exit code. **Notes do not.** An orphan stage is a note
 because whether it is dead depends on whether some CI job passes `--target`,
@@ -195,12 +197,62 @@ is the one that tells you not to trust the file.
 | `discarded-setting` | `ENV`, `USER`, `WORKDIR` or `SHELL` in such a stage, where nothing below it — in the stage or in any stage built `FROM` it — can read it. |
 | `superseded` | a setting a later line in the same stage replaces, with nothing in between that could have read the first one. |
 | `copy-from-unknown` | a `COPY --from=` naming no stage in the file, so Docker resolves it as an image. Names the closest stage if there is one. |
+| `dockerignored-copy` | a `COPY` or `ADD` whose sources `.dockerignore` keeps out of the build context. Needs `--context`. |
 | `unused-arg` | an `ARG` no build of this file can read. |
 | `orphan-stage` *(note)* | a stage no other stage builds `FROM` or copies out of. Only built if you name it with `--target`. |
 
-`--strict` adds `unknown-expansion`: a `${NAME}` this file never declares at
-all. Off by default because the base image may well set it — `${HOME}` and
-`${PATH}` are not bugs — and unbuilt does not pull images to find out.
+`--strict` adds two, both "true unless something outside this file supplies
+it". `unknown-expansion` is a `${NAME}` this file never declares at all — off
+by default because the base image may well set it, `${HOME}` and `${PATH}`
+are not bugs, and unbuilt does not pull images to find out.
+`missing-copy-source` is a `COPY` source that matches nothing in the context,
+which is off by default because plenty of builds generate their sources
+before `docker build` runs, and a `COPY dist/*.js` is not wrong just because
+you have not run the bundler yet.
+
+### `--context`, and `.dockerignore`
+
+`.dockerignore` decides what the builder is sent, so a `COPY` whose sources
+are all excluded is a line that does nothing — and it is the quietest kind
+there is:
+
+```
+$ unbuilt examples/Dockerfile --context examples
+...
+  line 13  dockerignored-copy  (deps)
+    COPY package.json package-lock.json ./
+    .dockerignore line 10 (*lock*) keeps package-lock.json out of the build
+    context, so the build fails here -- a named source that is not in the
+    context is not a warning, it is 'failed to compute cache key'
+```
+
+The two halves behave differently, which is worth knowing before you read a
+finding:
+
+- A **named** source that is excluded **fails the build**, with
+  `failed to compute cache key` and no mention of `.dockerignore` anywhere in
+  the message. One of these is fatal even if every other source on the line
+  works.
+- A **pattern** left with nothing to match **succeeds, having copied
+  nothing**. No file lands, the destination directory is not even created,
+  and the build goes green. This is the one worth owning the tool for.
+
+**You have to pass `--context`, and unbuilt will not guess it.** The context
+is `docker build`'s last argument and it is routinely not the directory the
+Dockerfile is in — `docker build -f docker/Dockerfile .` has its context at
+the repo root. Guessing wrong means reading the wrong `.dockerignore` and
+calling a working `COPY` dead on the strength of it, which is the one output
+that would make the whole tool untrustworthy.
+
+If the build you are checking uses `-f`, unbuilt looks for that file's own
+ignore file first: `docker build -f Dockerfile.ci` reads
+`Dockerfile.ci.dockerignore` **instead of** `.dockerignore`, not as well as.
+
+A `.dockerignore` that Docker itself rejects — an unterminated `[`, a
+trailing `\`, a bare `!` — stops `docker build` before it reads your
+Dockerfile at all. unbuilt says so on stderr, skips the context checks rather
+than guessing what the line meant, reports everything else as usual, and
+exits `2`.
 
 ### `--target`
 
@@ -223,10 +275,21 @@ $ unbuilt --target build Dockerfile
   `go build` exactly that way. unbuilt cannot see inside `make`, so a `RUN`
   anywhere downstream is enough for it to stay quiet. That is deliberate and
   not fixable from the file alone.
-- **Anything about `.dockerignore`.** A `COPY` whose source is excluded
-  copies nothing, which belongs on this list, but matching `.dockerignore`
-  means implementing Go's `filepath.Match` with Docker's own exception rules,
-  and getting it approximately right would be worse than not doing it.
+- **That a `COPY` copies *fewer* files than you meant.** Removing some of
+  what a pattern matches is `.dockerignore` doing its job — `COPY . /app`
+  next to a sensible ignore file is that case, and so is every well-run
+  repository. unbuilt only reports a source that arrives as *nothing*.
+- **A `COPY` source built out of `${...}`**, or an argument list it cannot
+  take apart. The instruction is dropped from the context checks entirely
+  rather than half-read, because a half-read argument list is how a working
+  `COPY` gets called dead. Every other check still runs over the line.
+- **`COPY --exclude=`**, BuildKit's per-instruction exclusion. It can only
+  ever remove more than `.dockerignore` does, so ignoring it costs findings
+  rather than inventing them.
+- **`.dockerignore` rules that match nothing**, which is the same question
+  [unignored](https://github.com/committed-nightly/unignored) answers for
+  `.gitignore` and is a check about the ignore file rather than about the
+  build.
 - **Whether the image works.** It is not a linter for style, a scanner for
   vulnerabilities, or a check that your `ENTRYPOINT` exists.
 - **`ONBUILD` bodies**, which are parsed as instructions but not followed
