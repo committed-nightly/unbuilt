@@ -373,15 +373,22 @@ def copy_sources(instruction: Instruction) -> list[str] | None:
 
 
 def _blame(ignore: context_module.Ignore, path: str) -> str:
+    """Name the rule and the file it is in, so there is a line to go and fix.
+
+    The filename is not decoration: a build run with `-f Dockerfile.ci` reads
+    `Dockerfile.ci.dockerignore` *instead of* `.dockerignore`, and being told
+    to look in the wrong one of the two is worse than not being told.
+    """
+    name = ignore.path.name if ignore.path is not None else ".dockerignore"
     pattern = ignore.blame(path)
     if pattern is None:
-        return "a .dockerignore rule"
-    return f".dockerignore line {pattern.line} ({pattern.source})"
+        return f"a rule in {name}"
+    return f"{name} line {pattern.line} ({pattern.source})"
 
 
 def _context_copies(
     graph: stages_module.Graph, build: context_module.Context, strict: bool
-) -> tuple[list[Finding], list[Finding]]:
+) -> list[Finding]:
     """`COPY` and `ADD` read against the context the builder would be sent.
 
     Target-independent, like `copy-from-unknown`: a source `.dockerignore`
@@ -394,7 +401,6 @@ def _context_copies(
     been the loudest possible false positive.
     """
     findings: list[Finding] = []
-    notes: list[Finding] = []
     ignore = build.ignore
 
     for stage in graph.stages:
@@ -407,7 +413,8 @@ def _context_copies(
             if sources is None:
                 continue
 
-            dead: list[tuple[str, str, bool]] = []  # (written, blame, is_pattern)
+            # (source as written, which rule did it, pattern?)
+            dead: list[tuple[str, str, bool]] = []
             missing: list[str] = []
             alive = 0
             for written in sources:
@@ -415,47 +422,64 @@ def _context_copies(
                 if source is None:
                     alive += 1  # `..` out of the context: not ours to judge.
                     continue
-                verdict = _source_verdict(build, source)
+                verdict, blamed = _source_verdict(build, source)
                 if verdict == "dead":
-                    blamed = source.matches[0] if source.matches else source.normalised
                     dead.append((written, _blame(ignore, blamed), source.is_pattern))
                 elif verdict == "missing":
                     missing.append(written)
                 else:
                     alive += 1
 
-            if dead and not alive and not missing:
-                findings.append(
-                    _dockerignored(instruction, stage, dead, len(sources))
-                )
-            elif dead:
-                notes.append(_partly_dockerignored(instruction, stage, dead))
+            # A *named* source with nothing behind it fails the build, and it
+            # does that whatever the other operands do -- so one dead name is
+            # enough, where one dead pattern is not.
+            fatal = [entry for entry in dead if not entry[2]]
+            if fatal:
+                findings.append(_dockerignored(instruction, stage, fatal))
+            elif dead and not (alive or missing):
+                findings.append(_dockerignored(instruction, stage, dead))
             elif missing and not alive and strict:
                 findings.append(_missing_sources(instruction, stage, missing))
 
-    return findings, notes
+    return findings
 
 
-def _source_verdict(build: context_module.Context, source: context_module.Source) -> str:
-    """"dead" (reaches the builder as nothing), "missing", or "alive"."""
+def _source_verdict(
+    build: context_module.Context, source: context_module.Source
+) -> tuple[str, str]:
+    """Whether one source reaches the builder as anything, and what to blame.
+
+    "dead" means *nothing* arrives. A source that loses some of its files and
+    keeps others is alive, and deliberately so: removing some of what a
+    `COPY` would otherwise pick up is the entire purpose of `.dockerignore`,
+    so a tool that remarked on it would fire on every repository that uses
+    the file correctly. `COPY . /app` beside a sensible `.dockerignore` is
+    the single most common pair of lines in the ecosystem.
+    """
     if source.is_pattern:
         if not source.matches:
-            return "missing"
-        return "alive" if any(build.survives(m) for m in source.matches) else "dead"
+            return "missing", source.normalised
+        gone = [m for m in source.matches if not build.survives(m)]
+        if len(gone) == len(source.matches):
+            return "dead", gone[0]
+        return "alive", source.normalised
 
     if build.ignore.excludes(source.normalised):
         if source.matches:  # It is on disk, so its kind is known.
-            return "dead" if not build.survives(source.normalised) else "alive"
+            alive = build.survives(source.normalised)
+            return ("alive" if alive else "dead"), source.normalised
         # Not on disk: it may be generated before the build runs. Without
         # negations an excluded path stays excluded whatever it turns out to
         # be, so the verdict holds; with them, a file inside it could be
         # re-included and this has no way to know.
-        return "dead" if not build.ignore.has_negations else "alive"
-    return "alive" if source.matches else "missing"
+        if build.ignore.has_negations:
+            return "alive", source.normalised
+        return "dead", source.normalised
+    return ("alive" if source.matches else "missing"), source.normalised
 
 
 def _dockerignored(
-    instruction: Instruction, stage: stages_module.Stage, dead, total: int
+    instruction: Instruction, stage: stages_module.Stage, dead
 ) -> Finding:
     written, blamed, is_pattern = dead[0]
     which = f"{written} (and {len(dead) - 1} more)" if len(dead) > 1 else written
@@ -471,30 +495,11 @@ def _dockerignored(
             "so the build fails here -- a named source that is not in the "
             "context is not a warning, it is 'failed to compute cache key'"
         )
-    _ = total
     return Finding(
         kind="dockerignored-copy",
         line=instruction.line,
         stage=stage.label,
         detail=f"{blamed} keeps {which} out of the build context, {outcome}",
-        instruction=_truncate(instruction.raw),
-    )
-
-
-def _partly_dockerignored(
-    instruction: Instruction, stage: stages_module.Stage, dead
-) -> Finding:
-    written, blamed, _ = dead[0]
-    which = f"{written} and {len(dead) - 1} other sources" if len(dead) > 1 else written
-    return Finding(
-        kind="partly-dockerignored-copy",
-        line=instruction.line,
-        stage=stage.label,
-        detail=(
-            f"{blamed} keeps {which} out of the build context; the rest of this "
-            f"instruction still copies, so the build goes green with fewer files "
-            f"than the line asks for"
-        ),
         instruction=_truncate(instruction.raw),
     )
 
@@ -625,9 +630,7 @@ def run(
     result.findings.extend(_copy_sources(graph))
     result.findings.extend(_unused_args(parsed.instructions, graph))
     if build is not None:
-        context_findings, context_notes = _context_copies(graph, build, strict)
-        result.findings.extend(context_findings)
-        result.notes.extend(context_notes)
+        result.findings.extend(_context_copies(graph, build, strict))
     result.findings.sort(key=lambda f: (f.line, f.kind))
     result.notes.sort(key=lambda f: (f.line, f.kind))
     result.skipped_stages = [
