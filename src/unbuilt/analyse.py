@@ -468,11 +468,16 @@ def _source_verdict(
         if source.matches:  # It is on disk, so its kind is known.
             alive = build.survives(source.normalised)
             return ("alive" if alive else "dead"), source.normalised
-        # Not on disk: it may be generated before the build runs. Without
-        # negations an excluded path stays excluded whatever it turns out to
-        # be, so the verdict holds; with them, a file inside it could be
-        # re-included and this has no way to know.
-        if build.ignore.has_negations:
+        # Not on disk: it may be generated before the build runs. The path
+        # itself is settled either way -- `excludes()` is exact for a literal
+        # path and does not consult the disk. The one thing an absent path
+        # hides is whether it will turn out to be a *directory* with a
+        # re-included file inside it, so only a negation that could land
+        # under this path leaves anything to be uncertain about. A negation
+        # naming a sibling does not, and deferring to every negation in the
+        # file went blind to this whole class of fatal finding for any
+        # repository that had one.
+        if build.ignore.negation_reaches_under(source.normalised):
             return "alive", source.normalised
         return "dead", source.normalised
     return ("alive" if source.matches else "missing"), source.normalised

@@ -119,6 +119,9 @@ class Pattern:
 
     line: int
     negated: bool
+    body: str
+    """The line cleaned of its `!` and its leading `/`, as segments to match."""
+
     regex: re.Pattern[str]
 
     def hits(self, path: str) -> bool:
@@ -131,6 +134,67 @@ class Pattern:
             return True
         parts = path.split("/")
         return any(self.regex.match("/".join(parts[:n])) for n in range(1, len(parts)))
+
+    def reaches_under(self, path: str) -> bool:
+        """Could this pattern match something strictly *inside* `path`?
+
+        Matching `path` itself does not count, and neither does matching a
+        directory above it. Both of those hit `path` and every one of its
+        children alike, so they cannot make a child's verdict differ from
+        its parent's -- only a pattern that reaches *in* can do that.
+
+        Answered without touching the disk, because the caller is asking
+        about a path that is not there yet. `path` has known segment names;
+        the pattern's segments are matched against them one at a time, with
+        `**` free to absorb any number. If the pattern still has segments
+        left once `path` is consumed, those segments describe something
+        below `path` -- and every segment this module compiles can be
+        satisfied by some name, so "left over" means "reaches under".
+        """
+        segments = self.body.split("/")
+        if any(seg != "**" and "**" in seg for seg in segments):
+            # A `**` glued to something else in one segment can cross a `/`
+            # (`_translate` gives it `(.*/)?`), so segment-at-a-time counting
+            # does not describe it. Nobody writes these; say "yes" and let
+            # the caller stay quiet rather than guess.
+            return True
+        here = _skip_empty_stars(segments, {0})
+        for name in path.split("/"):
+            nxt: set[int] = set()
+            for i in here:
+                if i >= len(segments):
+                    continue  # Pattern spent: it cannot reach this deep.
+                if segments[i] == "**":
+                    nxt.add(i)  # Absorbs this segment, and may absorb more.
+                elif _ignore_segment_regex(segments[i]).match(name):
+                    nxt.add(i + 1)
+            here = _skip_empty_stars(segments, nxt)
+            if not here:
+                return False
+        return any(i < len(segments) for i in here)
+
+
+def _skip_empty_stars(segments: list[str], positions: set[int]) -> set[int]:
+    """Positions reachable from `positions` by `**` matching no segments at all."""
+    out = set(positions)
+    stack = list(positions)
+    while stack:
+        i = stack.pop()
+        if i < len(segments) and segments[i] == "**" and i + 1 not in out:
+            out.add(i + 1)
+            stack.append(i + 1)
+    return out
+
+
+@lru_cache(maxsize=512)
+def _ignore_segment_regex(segment: str) -> re.Pattern[str]:
+    """One `.dockerignore` segment, compiled to match a single path segment.
+
+    Unlike `_segment_regex` this never sees a `**`: the caller handles those
+    itself, because in a `.dockerignore` they span segments and here we are
+    counting segments.
+    """
+    return re.compile(_translate(segment))
 
 
 @dataclass
@@ -150,6 +214,19 @@ class Ignore:
     @property
     def has_negations(self) -> bool:
         return any(p.negated for p in self.patterns)
+
+    def negation_reaches_under(self, path: str) -> bool:
+        """Could any negation re-include something inside `path`?
+
+        The scoped form of `has_negations`, for deciding whether an excluded
+        path that is not on disk yet has a knowable verdict. `excludes()`
+        already answers for the path itself; what a caller cannot know about
+        an absent path is whether it will turn out to be a directory with a
+        re-included file in it. A negation that names a sibling -- or
+        anything else that cannot land under this path -- leaves nothing to
+        be uncertain about.
+        """
+        return any(p.negated and p.reaches_under(path) for p in self.patterns)
 
     @classmethod
     def parse(cls, text: str, path: Path | None = None) -> Ignore:
@@ -172,6 +249,7 @@ class Ignore:
                     source=line,
                     line=number,
                     negated=negated,
+                    body=body,
                     regex=re.compile(_translate(body)),
                 )
             )
