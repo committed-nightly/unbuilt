@@ -6,7 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import analyse, report
+from . import analyse, context, report
 
 #: Exit 1 means "found instructions with no effect", like a linter. Exit 2 is
 #: argparse's, i.e. you typed it wrong, and also ours for a file we cannot read
@@ -48,11 +48,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--context",
+        metavar="DIR",
+        type=Path,
+        help=(
+            "the build context, as docker build's final argument -- enables "
+            "the .dockerignore checks, which are off without it"
+        ),
+    )
+    parser.add_argument(
         "--strict",
         action="store_true",
         help=(
             "also report references to names this file never declares, which "
-            "are empty unless the base image sets them"
+            "are empty unless the base image sets them, and COPY sources that "
+            "match nothing in the context"
         ),
     )
     parser.add_argument("--json", action="store_true", help="machine-readable output")
@@ -81,7 +91,36 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_USAGE
         label = str(path)
 
-    result = analyse.run(source, target=args.target, strict=args.strict)
+    build, context_error = None, None
+    if args.context is not None:
+        source_path = None if str(args.dockerfile) == "-" else args.dockerfile
+        if not args.context.is_dir():
+            context_error = (
+                f"{args.context} is not a directory, so there is no build "
+                f"context to read and the .dockerignore checks did not run"
+            )
+        else:
+            try:
+                build = context.open_context(args.context, source_path)
+            except context.BadPattern as error:
+                # Docker refuses to build at all on one of these -- "error in
+                # pattern", before it has looked at the Dockerfile. So this is
+                # not unbuilt being fussy: the checks are off because the build
+                # this file describes does not start.
+                ignore_path = context.ignore_file_for(args.context, source_path)
+                context_error = (
+                    f"{ignore_path}: {error} -- docker build rejects this file "
+                    f"outright, so the .dockerignore checks did not run"
+                )
+
+    result = analyse.run(
+        source, target=args.target, strict=args.strict, build=build
+    )
+    # Appended after the run so that everything unbuilt *can* say about the
+    # Dockerfile is still said. Same shape as an unknown --target: the report
+    # is worth having, and the exit code is what tells you it is partial.
+    if context_error is not None:
+        result.errors.append(context_error)
 
     # Errors go to stderr in every mode, so that whatever stdout is for in
     # this mode stays only that: one line per finding under -q, a parseable

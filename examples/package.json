@@ -1,0 +1,8 @@
+{
+  "name": "example-app",
+  "private": true,
+  "scripts": {
+    "build": "true",
+    "test": "true"
+  }
+}
