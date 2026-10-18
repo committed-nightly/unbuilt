@@ -279,6 +279,13 @@ $ unbuilt --target build Dockerfile
   what a pattern matches is `.dockerignore` doing its job — `COPY . /app`
   next to a sensible ignore file is that case, and so is every well-run
   repository. unbuilt only reports a source that arrives as *nothing*.
+- **An excluded directory your build generates, when a negation reaches
+  inside it.** `COPY build /app` beside `build` plus `!build/keep` depends
+  entirely on which files CI writes before `docker build` runs, and unbuilt
+  is reading the context before it writes any of them — so it says nothing.
+  This is the *only* case it defers on: a negation naming a sibling, or
+  anything else that could never land under the source, leaves nothing
+  unknown and is reported normally.
 - **A `COPY` source built out of `${...}`**, or an argument list it cannot
   take apart. The instruction is dropped from the context checks entirely
   rather than half-read, because a half-read argument list is how a working
