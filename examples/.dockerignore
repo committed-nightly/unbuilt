@@ -1,0 +1,10 @@
+# Keeping the context small, written the way people actually write these:
+# a few directories by name and then a pattern that looked safe.
+.git
+node_modules
+dist
+*.md
+
+# This is the one. It was meant for `yarn.lock` and `pnpm-lock.yaml` leftovers
+# and it also matches `package-lock.json`, which the deps stage copies by name.
+*lock*

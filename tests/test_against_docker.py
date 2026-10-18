@@ -19,7 +19,7 @@ import uuid
 
 import pytest
 
-from unbuilt import analyse
+from unbuilt import analyse, context
 from unbuilt.cli import main
 
 pytestmark = pytest.mark.docker
@@ -258,3 +258,356 @@ def test_a_copy_from_that_names_no_stage_is_resolved_as_an_image(build):
 
     findings = analyse.run(text).findings
     assert [f.kind for f in findings] == ["copy-from-unknown"]
+
+
+# --- .dockerignore -------------------------------------------------------
+#
+# The matcher in context.py is a reimplementation of somebody else's matcher,
+# which is the worst kind of code to leave unmeasured: it is right until
+# BuildKit changes, and wrong silently. So the first test below does not check
+# a handful of cases by hand -- it builds each pattern set for real, asks the
+# image which files actually arrived, and asserts unbuilt predicted that exact
+# set. A disagreement anywhere is a failure here.
+
+#: A context with the awkward bits in it: nesting, a name that is a regex
+#: metacharacter, and a directory people always exclude.
+TREE = (
+    "root.txt", "root.log", "secret.key",
+    "a/mid.txt", "a/mid.log", "a/b/deep.txt", "a/b/deep.log",
+    "keep/k.log", "keep/k.txt",
+    "x/y/z/buried.txt",
+    "node_modules/pkg/index.js",
+    "weird/na+me.txt", "weird/pa(ren).txt", "weird/do.t.txt",
+)
+
+PATTERN_SETS = [
+    "*.log",
+    "**/*.log",
+    "a",
+    "a/",
+    "/root.log",
+    "a/**",
+    "*\n!keep",
+    "a\n!a/mid.txt",
+    "a\n!a/b/deep.txt",
+    "*.log\n!root.log\nroot.log",
+    "**",
+    "x/**/buried.txt",
+    "*/y",
+    "x/*/z",
+    "**/z",
+    "node_modules",
+    "secret.ke?",
+    "secret.[kx]ey",
+    "# comment\n\n  secret.key  ",
+    "weird/na+me.txt",
+    "weird/pa(ren).txt",
+    "weird/do.t.txt",
+    "weird/*.txt\n!weird/do.t.txt",
+    "a/b\nkeep/*.log\n!keep/k.log",
+    "./a/mid.txt",
+    "a/../root.txt",
+    "**/deep.*",
+    "k*/",
+    "x\n!x/y\n!x/y/z\n!x/y/z/buried.txt",
+    ".",
+]
+
+
+def _populate(root) -> None:
+    for relative in TREE:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x\n")
+
+
+@needs_docker
+@pytest.mark.parametrize("patterns", PATTERN_SETS, ids=lambda p: p.replace("\n", "|"))
+def test_the_matcher_agrees_with_buildkit_on_what_reaches_the_context(
+    patterns, tmp_path
+):
+    """Build the context for real and compare it to what unbuilt predicted."""
+    _populate(tmp_path)
+    (tmp_path / ".dockerignore").write_text(patterns + "\n")
+    (tmp_path / "Dockerfile").write_text("FROM scratch\nCOPY . /ctx\n")
+
+    destination = tmp_path.parent / (tmp_path.name + "-out")
+    completed = subprocess.run(
+        ["docker", "build", "-q", "-o", f"type=local,dest={destination}", "."],
+        cwd=tmp_path, capture_output=True, text=True, timeout=300,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+    landed = {
+        str(path.relative_to(destination / "ctx"))
+        for path in (destination / "ctx").rglob("*")
+        if path.is_file()
+    }
+    everything = set(TREE) | {"Dockerfile", ".dockerignore"}
+    ignore = context.Ignore.parse(patterns)
+    predicted = {path for path in everything if not ignore.excludes(path)}
+
+    assert predicted == landed, (
+        f"patterns {patterns!r}\n"
+        f"  docker kept, unbuilt dropped: {sorted(landed - predicted)}\n"
+        f"  unbuilt kept, docker dropped: {sorted(predicted - landed)}"
+    )
+
+
+@needs_docker
+def test_a_pattern_with_nothing_left_to_match_copies_nothing_and_still_succeeds(
+    build, tmp_path
+):
+    """The silent one, and the reason `dockerignored-copy` exists.
+
+    An excluded *named* source fails the build, loudly. An excluded *pattern*
+    does not: it matches nothing, copies nothing, creates nothing at the
+    destination, and exits 0. Nothing in the output mentions it.
+    """
+    (tmp_path / ".dockerignore").write_text("*.key\n")
+    (tmp_path / "secret.key").write_text("hunter2\n")
+    text = "FROM scratch\nCOPY *.key /secrets/\n"
+    ok, output, _ = build(text)
+    assert ok, output
+
+    destination = tmp_path.parent / "silent-out"
+    subprocess.run(
+        ["docker", "build", "-q", "-o", f"type=local,dest={destination}", "."],
+        cwd=tmp_path, check=True, capture_output=True, timeout=300,
+    )
+    assert list(destination.rglob("*")) == []  # not even an empty /secrets
+
+    result = analyse.run(text, build=context.open_context(tmp_path))
+    assert [(f.kind, f.line) for f in result.findings] == [("dockerignored-copy", 2)]
+
+
+@needs_docker
+def test_an_excluded_named_source_fails_the_build(build, tmp_path):
+    (tmp_path / ".dockerignore").write_text("dist\n")
+    (tmp_path / "dist").mkdir()
+    (tmp_path / "dist" / "bundle.js").write_text("console.log(1)\n")
+    text = "FROM scratch\nCOPY dist /dist\n"
+
+    ok, output, _ = build(text)
+    assert not ok
+    assert "failed to compute cache key" in output
+
+    result = analyse.run(text, build=context.open_context(tmp_path))
+    assert [(f.kind, f.line) for f in result.findings] == [("dockerignored-copy", 2)]
+
+
+@needs_docker
+def test_a_negation_re_includes_under_an_excluded_directory(build, tmp_path):
+    """git's rule is that you cannot do this. unbuilt must not inherit it.
+
+    If unbuilt applied git's semantics it would call this `COPY` dead, which
+    is exactly the false positive that kept `.dockerignore` out of the tool
+    in the first place.
+    """
+    (tmp_path / ".dockerignore").write_text("dist\n!dist/keep.js\n")
+    (tmp_path / "dist").mkdir()
+    (tmp_path / "dist" / "keep.js").write_text("kept\n")
+    (tmp_path / "dist" / "drop.js").write_text("dropped\n")
+    text = "FROM scratch\nCOPY dist /dist\n"
+
+    ok, output, _ = build(text)
+    assert ok, output
+
+    destination = tmp_path.parent / "negation-out"
+    subprocess.run(
+        ["docker", "build", "-q", "-o", f"type=local,dest={destination}", "."],
+        cwd=tmp_path, check=True, capture_output=True, timeout=300,
+    )
+    assert {p.name for p in (destination / "dist").iterdir()} == {"keep.js"}
+
+    result = analyse.run(text, build=context.open_context(tmp_path))
+    assert (result.findings, result.notes) == ([], [])  # it copies, so it is alive
+
+
+@needs_docker
+def test_copy_from_a_stage_does_not_read_the_context(build, tmp_path):
+    """A `.dockerignore` rule matching the source path is irrelevant here."""
+    (tmp_path / ".dockerignore").write_text("artifact\n")
+    (tmp_path / "payload.txt").write_text("payload\n")
+    text = (
+        "FROM scratch AS build\n"
+        "COPY payload.txt /artifact\n"
+        "FROM scratch\n"
+        "COPY --from=build /artifact /artifact\n"
+    )
+    ok, output, _ = build(text)
+    assert ok, output
+
+    result = analyse.run(text, build=context.open_context(tmp_path))
+    assert (result.findings, result.notes) == ([], [])
+
+
+@needs_docker
+def test_a_per_dockerfile_ignore_file_replaces_the_plain_one(tmp_path):
+    (tmp_path / "one.txt").write_text("1\n")
+    (tmp_path / "two.txt").write_text("2\n")
+    (tmp_path / ".dockerignore").write_text("one.txt\n")
+    (tmp_path / "Dockerfile.foo.dockerignore").write_text("two.txt\n")
+    (tmp_path / "Dockerfile.foo").write_text("FROM scratch\nCOPY . /ctx\n")
+
+    destination = tmp_path.parent / "specific-out"
+    subprocess.run(
+        ["docker", "build", "-q", "-f", "Dockerfile.foo",
+         "-o", f"type=local,dest={destination}", "."],
+        cwd=tmp_path, check=True, capture_output=True, timeout=300,
+    )
+    landed = {p.name for p in (destination / "ctx").iterdir()}
+
+    # one.txt survived: the specific file replaced `.dockerignore` rather
+    # than adding to it.
+    assert "one.txt" in landed and "two.txt" not in landed
+
+    chosen = context.ignore_file_for(tmp_path, tmp_path / "Dockerfile.foo")
+    assert chosen.name == "Dockerfile.foo.dockerignore"
+    assert not context.load(tmp_path, tmp_path / "Dockerfile.foo").excludes("one.txt")
+
+
+@needs_docker
+@pytest.mark.parametrize("pattern", ["f[.txt", "f.txt\\", "!"])
+def test_docker_refuses_a_malformed_pattern_so_unbuilt_must_not_guess(
+    pattern, build, tmp_path
+):
+    """These do not merely behave oddly -- the build never starts."""
+    (tmp_path / ".dockerignore").write_text(pattern + "\n")
+    ok, output, _ = build("FROM scratch\nCOPY payload.txt /payload\n")
+    assert not ok, output
+
+    with pytest.raises(context.BadPattern):
+        context.load(tmp_path)
+
+    # And the CLI says so on stderr, exits 2, and still reports the file.
+    assert main([str(tmp_path / "Dockerfile"), "--context", str(tmp_path)]) == 2
+
+
+@needs_docker
+def test_copy_source_patterns_have_no_double_star(build, tmp_path):
+    """`COPY **/*.go` is `COPY */*.go`, which `.dockerignore`'s `**` is not.
+
+    Letting the two matchers share an implementation would make unbuilt
+    believe `COPY **/*.go` picks up `deep/c.go`, and then call a `.dockerignore`
+    rule covering it the reason a file went missing.
+    """
+    for relative in ("a.go", "src/b.go", "src/deep/c.go"):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("package main\n")
+    (tmp_path / ".dockerignore").write_text("")
+    (tmp_path / "Dockerfile").write_text("FROM scratch\nCOPY **/*.go /out/\n")
+
+    destination = tmp_path.parent / "glob-out"
+    subprocess.run(
+        ["docker", "build", "-q", "-o", f"type=local,dest={destination}", "."],
+        cwd=tmp_path, check=True, capture_output=True, timeout=300,
+    )
+    assert {p.name for p in (destination / "out").iterdir()} == {"b.go"}
+
+    resolved = context.open_context(tmp_path).resolve("**/*.go")
+    assert resolved.matches == ("src/b.go",)
+
+
+# --- the absent source, measured once it exists --------------------------
+#
+# A `COPY` source that is not in the context yet is the subtlest verdict
+# unbuilt reaches, because the thing it is describing has not happened. The
+# ground truth is still available, though: generate the source the way CI
+# would, run the build, and see whether Docker agrees the line was dead.
+#
+# The first version of this check deferred to `.dockerignore` having *any*
+# negation in it, which silently gave up on every repository that has one.
+# These cases are why it now asks whether a negation could land under the
+# source itself.
+
+#: (ignore file, `COPY` source, what CI creates after unbuilt has run)
+GENERATED_CASES = [
+    # The negation names a sibling, a deeper sibling, an unrelated path: none
+    # of them can ever re-include this source, so the verdict is knowable.
+    ("dist\n!dist/keep.js", "dist/gen.js", ("dist/gen.js",)),
+    ("dist\n!dist/sub/keep.js", "dist/gen.js", ("dist/gen.js",)),
+    ("dist\n!unrelated/keep.js", "dist/gen.js", ("dist/gen.js",)),
+    ("*\n!keep", "gen.js", ("gen.js",)),
+    # The same miss one level up: an excluded directory CI fills in.
+    ("build\n!other/keep", "build", ("build/out.txt",)),
+    # No negation at all, which always worked.
+    ("dist", "dist/gen.js", ("dist/gen.js",)),
+    # And the other answer: the negation names this very source, or reaches
+    # into it, so the file arrives and the build is fine.
+    ("dist\n!dist/gen.js", "dist/gen.js", ("dist/gen.js",)),
+    ("dist\n!dist/**", "dist/gen.js", ("dist/gen.js",)),
+    ("build\n!build/out.txt", "build", ("build/out.txt",)),
+]
+
+
+def _build_fails(root) -> tuple[bool, str]:
+    completed = subprocess.run(
+        ["docker", "build", "-q", "."],
+        cwd=root, capture_output=True, text=True, timeout=300,
+    )
+    return completed.returncode != 0, completed.stdout + completed.stderr
+
+
+@needs_docker
+@pytest.mark.parametrize(
+    "patterns,source,generated",
+    GENERATED_CASES,
+    ids=lambda value: value.replace("\n", "|") if isinstance(value, str) else "",
+)
+def test_the_verdict_on_an_absent_source_agrees_with_buildkit(
+    patterns, source, generated, tmp_path
+):
+    """Ask unbuilt while the source is missing, ask Docker once it is there."""
+    (tmp_path / ".dockerignore").write_text(patterns + "\n")
+    (tmp_path / "Dockerfile").write_text(f"FROM scratch\nCOPY {source} /app/\n")
+
+    # unbuilt runs against the context as CI leaves it: source not yet built.
+    result = analyse.run(
+        (tmp_path / "Dockerfile").read_text(),
+        build=context.open_context(tmp_path),
+    )
+    called_dead = [f.kind for f in result.findings] == ["dockerignored-copy"]
+
+    for relative in generated:  # ... and now the build step that writes it.
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("generated\n")
+
+    failed, output = _build_fails(tmp_path)
+    assert called_dead == failed, (
+        f"patterns {patterns!r}, COPY {source}\n"
+        f"  unbuilt called it dead: {called_dead}\n"
+        f"  docker build failed:    {failed}\n{output}"
+    )
+
+
+@needs_docker
+@pytest.mark.parametrize("generated", [("build/keep",), ("build/other",)])
+def test_the_remaining_deferral_is_a_real_coin_toss_not_a_preference(
+    generated, tmp_path
+):
+    """Why the narrowed deferral still has to exist.
+
+    `build` is excluded and `!build/keep` reaches inside it. Whether the
+    build survives depends entirely on which files CI writes, and unbuilt is
+    looking at the context before it writes any of them. Docker goes both
+    ways on the same Dockerfile and the same ignore file; the only honest
+    answer at that point is silence.
+    """
+    (tmp_path / ".dockerignore").write_text("build\n!build/keep\n")
+    (tmp_path / "Dockerfile").write_text("FROM scratch\nCOPY build /app\n")
+
+    result = analyse.run(
+        (tmp_path / "Dockerfile").read_text(),
+        build=context.open_context(tmp_path),
+    )
+    assert result.findings == []  # Said nothing, and had to.
+
+    path = tmp_path / generated[0]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("generated\n")
+
+    failed, _ = _build_fails(tmp_path)
+    assert failed == (generated[0] == "build/other")
