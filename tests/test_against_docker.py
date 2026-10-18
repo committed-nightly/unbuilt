@@ -508,3 +508,106 @@ def test_copy_source_patterns_have_no_double_star(build, tmp_path):
 
     resolved = context.open_context(tmp_path).resolve("**/*.go")
     assert resolved.matches == ("src/b.go",)
+
+
+# --- the absent source, measured once it exists --------------------------
+#
+# A `COPY` source that is not in the context yet is the subtlest verdict
+# unbuilt reaches, because the thing it is describing has not happened. The
+# ground truth is still available, though: generate the source the way CI
+# would, run the build, and see whether Docker agrees the line was dead.
+#
+# The first version of this check deferred to `.dockerignore` having *any*
+# negation in it, which silently gave up on every repository that has one.
+# These cases are why it now asks whether a negation could land under the
+# source itself.
+
+#: (ignore file, `COPY` source, what CI creates after unbuilt has run)
+GENERATED_CASES = [
+    # The negation names a sibling, a deeper sibling, an unrelated path: none
+    # of them can ever re-include this source, so the verdict is knowable.
+    ("dist\n!dist/keep.js", "dist/gen.js", ("dist/gen.js",)),
+    ("dist\n!dist/sub/keep.js", "dist/gen.js", ("dist/gen.js",)),
+    ("dist\n!unrelated/keep.js", "dist/gen.js", ("dist/gen.js",)),
+    ("*\n!keep", "gen.js", ("gen.js",)),
+    # The same miss one level up: an excluded directory CI fills in.
+    ("build\n!other/keep", "build", ("build/out.txt",)),
+    # No negation at all, which always worked.
+    ("dist", "dist/gen.js", ("dist/gen.js",)),
+    # And the other answer: the negation names this very source, or reaches
+    # into it, so the file arrives and the build is fine.
+    ("dist\n!dist/gen.js", "dist/gen.js", ("dist/gen.js",)),
+    ("dist\n!dist/**", "dist/gen.js", ("dist/gen.js",)),
+    ("build\n!build/out.txt", "build", ("build/out.txt",)),
+]
+
+
+def _build_fails(root) -> tuple[bool, str]:
+    completed = subprocess.run(
+        ["docker", "build", "-q", "."],
+        cwd=root, capture_output=True, text=True, timeout=300,
+    )
+    return completed.returncode != 0, completed.stdout + completed.stderr
+
+
+@needs_docker
+@pytest.mark.parametrize(
+    "patterns,source,generated",
+    GENERATED_CASES,
+    ids=lambda value: value.replace("\n", "|") if isinstance(value, str) else "",
+)
+def test_the_verdict_on_an_absent_source_agrees_with_buildkit(
+    patterns, source, generated, tmp_path
+):
+    """Ask unbuilt while the source is missing, ask Docker once it is there."""
+    (tmp_path / ".dockerignore").write_text(patterns + "\n")
+    (tmp_path / "Dockerfile").write_text(f"FROM scratch\nCOPY {source} /app/\n")
+
+    # unbuilt runs against the context as CI leaves it: source not yet built.
+    result = analyse.run(
+        (tmp_path / "Dockerfile").read_text(),
+        build=context.open_context(tmp_path),
+    )
+    called_dead = [f.kind for f in result.findings] == ["dockerignored-copy"]
+
+    for relative in generated:  # ... and now the build step that writes it.
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("generated\n")
+
+    failed, output = _build_fails(tmp_path)
+    assert called_dead == failed, (
+        f"patterns {patterns!r}, COPY {source}\n"
+        f"  unbuilt called it dead: {called_dead}\n"
+        f"  docker build failed:    {failed}\n{output}"
+    )
+
+
+@needs_docker
+@pytest.mark.parametrize("generated", [("build/keep",), ("build/other",)])
+def test_the_remaining_deferral_is_a_real_coin_toss_not_a_preference(
+    generated, tmp_path
+):
+    """Why the narrowed deferral still has to exist.
+
+    `build` is excluded and `!build/keep` reaches inside it. Whether the
+    build survives depends entirely on which files CI writes, and unbuilt is
+    looking at the context before it writes any of them. Docker goes both
+    ways on the same Dockerfile and the same ignore file; the only honest
+    answer at that point is silence.
+    """
+    (tmp_path / ".dockerignore").write_text("build\n!build/keep\n")
+    (tmp_path / "Dockerfile").write_text("FROM scratch\nCOPY build /app\n")
+
+    result = analyse.run(
+        (tmp_path / "Dockerfile").read_text(),
+        build=context.open_context(tmp_path),
+    )
+    assert result.findings == []  # Said nothing, and had to.
+
+    path = tmp_path / generated[0]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("generated\n")
+
+    failed, _ = _build_fails(tmp_path)
+    assert failed == (generated[0] == "build/other")

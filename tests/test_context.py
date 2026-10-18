@@ -89,6 +89,63 @@ class TestPatterns:
             Ignore.parse(pattern)
 
 
+def reaches(pattern: str, path: str) -> bool:
+    (only,) = Ignore.parse(pattern).patterns
+    return only.reaches_under(path)
+
+
+class TestNegationScope:
+    """Which negations could re-include something *inside* a given path.
+
+    This is what decides whether an excluded source that is not on disk yet
+    has a knowable verdict. `excludes()` settles the path itself whatever is
+    on disk; the only thing an absent path hides is whether it is a directory
+    with a re-included file in it, and only a negation that reaches *in* can
+    put one there.
+    """
+
+    def test_a_negation_naming_a_sibling_does_not_reach_in(self):
+        """The whole bug: `!dist/keep.js` says nothing about `dist/gen.js`."""
+        assert not reaches("dist/keep.js", "dist/gen.js")
+        assert not reaches("dist/sub/keep.js", "dist/gen.js")
+        assert not reaches("unrelated/keep.js", "dist/gen.js")
+
+    def test_a_negation_naming_a_child_reaches_in(self):
+        assert reaches("build/keep", "build")
+        assert reaches("build/a/b/deep.txt", "build")
+
+    def test_matching_the_path_itself_is_not_reaching_under_it(self):
+        """It hits the path and every child alike, so no child can differ."""
+        assert not reaches("build", "build")
+
+    def test_nor_is_matching_a_directory_above_it(self):
+        assert not reaches("dist", "dist/gen.js")
+
+    def test_a_root_anchored_negation_cannot_be_inside_a_directory(self):
+        assert not reaches("keep.js", "dist")
+
+    def test_double_star_reaches_everywhere_it_is_allowed_to(self):
+        assert reaches("**", "dist")
+        assert reaches("**/keep.js", "dist/sub")
+        assert reaches("dist/**", "dist")
+        assert not reaches("dist/**", "other")
+
+    def test_a_glob_segment_reaches_in_when_it_can_match_the_name(self):
+        assert reaches("a/*/keep", "a/c")
+        assert not reaches("a/b/keep", "a/c")
+
+    def test_an_embedded_double_star_is_deferred_to_rather_than_counted(self):
+        """`a**b` can cross a `/`, so counting segments does not describe it."""
+        assert reaches("a**b", "anything")
+
+    def test_the_ignore_level_question_takes_only_the_negations(self):
+        ignore = Ignore.parse("dist\n!dist/keep.js\nbuild\n!build/keep")
+        assert not ignore.negation_reaches_under("dist/gen.js")
+        assert ignore.negation_reaches_under("build")
+        # `dist` and `build` are excludes, not negations: they are not asked.
+        assert not ignore.negation_reaches_under("elsewhere")
+
+
 class TestIgnoreFile:
     def test_a_per_dockerfile_ignore_file_replaces_the_plain_one(self, tmp_path):
         (tmp_path / ".dockerignore").write_text("one.txt\n")
@@ -267,6 +324,45 @@ class TestVerdicts:
         """Nothing named `build` is on disk, and nothing can re-include it."""
         findings, _ = self.analyse(tree, "build", "FROM scratch\nCOPY build /app\n")
         assert findings == [("dockerignored-copy", 2)]
+
+    def test_a_negation_that_cannot_reach_the_source_does_not_buy_it_silence(self, tree):
+        """The build fails unconditionally, so staying quiet was a miss.
+
+        `!dist/keep.js` names a sibling of `dist/gen.js`. It cannot
+        re-include it at any point in the future, whatever CI generates, so
+        there is nothing here unbuilt does not know. Deferring to any
+        negation anywhere in the file went blind to this entire fatal class
+        for every repository with one negation in it.
+        """
+        findings, _ = self.analyse(
+            tree, "dist\n!dist/keep.js", "FROM scratch\nCOPY dist/gen.js /app/\n"
+        )
+        assert findings == [("dockerignored-copy", 2)]
+
+    def test_a_generated_directory_beside_an_unrelated_negation_is_decidable(self, tree):
+        """Same miss one level up: `build` is a directory nothing reaches into."""
+        findings, _ = self.analyse(
+            tree, "build\n!other/keep", "FROM scratch\nCOPY build /app\n"
+        )
+        assert findings == [("dockerignored-copy", 2)]
+
+    def test_the_blame_names_the_excluding_line_not_the_negation(self, tree):
+        result = analyse.run(
+            "FROM scratch\nCOPY dist/gen.js /app/\n",
+            build=tree("# header\ndist\n!dist/keep.js"),
+        )
+        assert "dist" in result.findings[0].detail
+        assert "keep.js" not in result.findings[0].detail
+
+    def test_a_negation_reaching_into_the_source_still_defers(self, tree):
+        """The deferral is narrowed, not removed. `!dist/keep.js` could land
+        inside `dist/sub` if CI generates `dist/sub/` -- it cannot, in fact,
+        but a negation one level deeper could, and that is the shape of case
+        this stays quiet for."""
+        findings, notes = self.analyse(
+            tree, "dist\n!dist/sub/keep.js", "FROM scratch\nCOPY dist/sub /app\n"
+        )
+        assert (findings, notes) == ([], [])
 
     def test_no_context_means_no_context_checks(self, tree):
         result = analyse.run("FROM scratch\nCOPY dist /dist\n", strict=True)
