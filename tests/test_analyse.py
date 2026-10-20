@@ -319,6 +319,88 @@ def test_a_real_stage_name_is_left_alone():
     assert "copy-from-unknown" not in kinds(text)
 
 
+# --- COPY of something only ADD can fetch ----------------------------------
+
+
+def only_remote(text: str, **kwargs) -> list:
+    return [
+        f
+        for f in analyse.run(text, **kwargs).findings
+        if f.kind == "copy-remote-source"
+    ]
+
+
+def test_a_copy_of_a_git_ref_is_the_build_failing():
+    text = "FROM alpine AS f\nCOPY https://example.com/o/r.git /src\n"
+    findings = only_remote(text)
+    assert len(findings) == 1
+    assert "only ADD can fetch one" in findings[0].detail
+    assert "source can't be a git ref for COPY" in findings[0].detail
+
+
+def test_a_copy_of_a_url_quotes_the_other_refusal():
+    text = "FROM alpine AS f\nCOPY https://example.com/x.tar.gz /src\n"
+    findings = only_remote(text)
+    assert len(findings) == 1
+    assert "source can't be a URL for COPY" in findings[0].detail
+
+
+def test_from_does_not_excuse_it():
+    """Measured: the refusal is on the operand's shape, --from or no --from."""
+    text = (
+        "FROM alpine AS b\nRUN a\n"
+        "FROM alpine AS f\nCOPY --from=b https://example.com/o/r.git /src\n"
+    )
+    assert len(only_remote(text)) == 1
+
+
+def test_add_is_how_you_do_it_and_is_not_reported():
+    for source in ("https://example.com/o/r.git", "https://example.com/x.tar.gz"):
+        text = f"FROM alpine AS f\nADD {source} /src\n"
+        assert only_remote(text) == [], source
+
+
+def test_a_local_path_that_looks_remote_is_not_reported():
+    """logbook#47 from the other side: these are ordinary context reads."""
+    for source in (".git", "foo.git", "example.com/o/r.git", "git+ssh://h/o/r.git"):
+        text = f"FROM alpine AS f\nCOPY {source} /src\n"
+        assert only_remote(text) == [], source
+
+
+def test_a_stage_this_target_does_not_build_is_a_note_not_a_failure():
+    """Measured: an orphan stage is never converted, so the refusal never fires.
+
+    A note rather than silence, because a stage nothing builds is the only
+    place this mistake can sit in a repository without failing something.
+    """
+    text = (
+        "FROM alpine AS dead\nCOPY https://example.com/o/r.git /src\n"
+        "FROM alpine AS f\nRUN a\n"
+    )
+    assert only_remote(text) == []
+    assert notes(text) == ["orphan-stage", "copy-remote-source"]
+    assert "does not build dead" in analyse.run(text).notes[1].detail
+
+    # ...and naming the stage makes it the failure it is.
+    assert len(only_remote(text, target="dead")) == 1
+    assert "copy-remote-source" not in notes(text, target="dead")
+
+
+def test_several_remote_sources_on_one_line_report_once():
+    text = (
+        "FROM alpine AS f\n"
+        "COPY https://example.com/a.git https://example.com/b.git /src/\n"
+    )
+    findings = only_remote(text)
+    assert len(findings) == 1
+    assert "(and 1 more)" in findings[0].detail
+
+
+def test_a_source_it_cannot_read_is_not_guessed_at():
+    text = "FROM alpine AS f\nCOPY ${REPO_URL} /src\n"
+    assert only_remote(text) == []
+
+
 # --- unused ARGs -----------------------------------------------------------
 
 

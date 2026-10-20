@@ -611,3 +611,156 @@ def test_the_remaining_deferral_is_a_real_coin_toss_not_a_preference(
 
     failed, _ = _build_fails(tmp_path)
     assert failed == (generated[0] == "build/other")
+
+
+# --- sources the builder fetches instead of reading ------------------------
+#
+# Every claim unbuilt makes here is a claim about which of two code paths
+# BuildKit takes, and the two fail differently when the thing is not there:
+# a context read says `"/x": not found`, a fetch says it could not resolve
+# the host or that it has no ssh key. An unreachable host is enough to tell
+# them apart, so these still need no network -- with no DNS at all the fetch
+# cases fail earlier and in the same direction.
+
+#: (source operand, is it read out of the build context?)
+SOURCE_SHAPES = [
+    ("https://example.invalid/o/r.git", False),
+    ("https://example.invalid/o/r.git#main", False),
+    ("HTTPS://EXAMPLE.INVALID/o/r.git", False),
+    ("https://example.invalid/o/r", False),
+    ("https://example.invalid/file.tar.gz", False),
+    ("git://example.invalid/o/r.git", False),
+    ("ssh://git@example.invalid/o/r.git", False),
+    ("git@example.invalid:o/r.git", False),
+    ("git@example.invalid:o/r", False),
+    ("a@b:c", False),
+    # The other half, and the surprising one. Each of these looks remote and
+    # is a path in the build context.
+    ("example.invalid/o/r.git", True),
+    ("example.invalid/o/r.git#main", True),
+    ("example.invalid:8080/o/r.git", True),
+    ("git+ssh://example.invalid/o/r.git", True),
+    ("git+http://example.invalid/o/r.git", True),
+    ("my.user@example.invalid:o/r.git", True),
+    ("u@my_host:o/r.git", True),
+    ("dir/u@host:p", True),
+    ("./u@host:p", True),
+    ("nope.git", True),
+]
+
+#: What BuildKit says when it looked for the source in the context.
+_CONTEXT_READ = ": not found"
+
+#: ...and when it tried to fetch it. One of these, or it failed for a third
+#: reason and the test should say so rather than pass.
+_FETCHED = (
+    "Could not resolve host",
+    "unset ssh forward key",
+    "no such host",
+    "unable to look up",
+)
+
+
+@needs_docker
+@pytest.mark.parametrize("source,local", SOURCE_SHAPES, ids=lambda v: str(v))
+def test_is_remote_source_agrees_with_buildkit(source, local, tmp_path):
+    """Nothing is in the context, so every case fails. *How* is the answer."""
+    (tmp_path / "Dockerfile").write_text(f"FROM scratch\nADD {source} /dst\n")
+    completed = subprocess.run(
+        ["docker", "build", "-q", "."],
+        cwd=tmp_path, capture_output=True, text=True, timeout=300,
+    )
+    output = completed.stdout + completed.stderr
+    assert completed.returncode != 0, output
+
+    if local:
+        assert _CONTEXT_READ in output, output
+    else:
+        assert any(marker in output for marker in _FETCHED), output
+    assert analyse.is_remote_source(source) is not local, output
+
+
+@needs_docker
+def test_a_dockerignored_dot_git_directory_fails_the_build(build, tmp_path):
+    """logbook#47. The suffix guard dropped this instruction, so unbuilt was
+    silent about a build that cannot start -- and `.git` in `.dockerignore`
+    beside a `COPY .git` is a real pair of lines, not a constructed one."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    (tmp_path / ".dockerignore").write_text(".git\n")
+
+    ok, output, _ = build("FROM scratch\nCOPY .git /app/\n")
+    assert not ok and "failed to compute cache key" in output, output
+
+    result = analyse.run(
+        (tmp_path / "Dockerfile").read_text(),
+        build=context.open_context(tmp_path),
+    )
+    assert [f.kind for f in result.findings] == ["dockerignored-copy"]
+
+
+@needs_docker
+def test_the_same_directory_with_no_rule_against_it_is_copied(build, tmp_path):
+    """The other direction, which is what makes the finding above safe."""
+    (tmp_path / "foo.git").mkdir()
+    (tmp_path / "foo.git" / "HEAD").write_text("ref: refs/heads/main\n")
+
+    ok, output, _ = build("FROM scratch\nCOPY foo.git /app/\n")
+    assert ok, output
+
+    result = analyse.run(
+        (tmp_path / "Dockerfile").read_text(),
+        build=context.open_context(tmp_path),
+    )
+    assert result.findings == []
+
+
+@needs_docker
+@pytest.mark.parametrize(
+    "source,refusal",
+    [
+        ("https://example.invalid/o/r.git", "source can't be a git ref for COPY"),
+        ("git@example.invalid:o/r.git", "source can't be a git ref for COPY"),
+        ("git://example.invalid/o/r.git", "source can't be a git ref for COPY"),
+        ("https://example.invalid/x.tar.gz", "source can't be a URL for COPY"),
+        ("https://example.invalid/o/r", "source can't be a URL for COPY"),
+    ],
+    ids=lambda v: str(v),
+)
+def test_copy_cannot_fetch_and_unbuilt_quotes_the_refusal_verbatim(
+    build, source, refusal, tmp_path
+):
+    """The detail text quotes BuildKit, so BuildKit gets to check the quote."""
+    text = f"FROM scratch\nCOPY {source} /dst\n"
+    ok, output, _ = build(text)
+    assert not ok
+    assert refusal in output, output
+
+    findings = [f for f in analyse.run(text).findings if f.kind == "copy-remote-source"]
+    assert len(findings) == 1
+    assert refusal in findings[0].detail
+
+
+@needs_docker
+def test_a_copy_of_a_git_ref_in_a_stage_nothing_builds_is_not_a_failure(build):
+    """Why this one check follows --target: the refusal is per converted stage."""
+    text = (
+        "FROM scratch AS dead\nCOPY https://example.invalid/o/r.git /dst\n"
+        "\nFROM scratch AS final\nCOPY payload.txt /payload\n"
+    )
+    ok, output, _ = build(text)
+    assert ok, output
+    assert analyse.run(text).findings == []
+    # Not a finding, and not nothing either: a stage nothing builds is where
+    # this mistake can sit in a repository without failing anything.
+    assert [n.kind for n in analyse.run(text).notes] == [
+        "orphan-stage",
+        "copy-remote-source",
+    ]
+
+    ok, output, _ = build(text, "--target", "dead")
+    assert not ok
+    assert "source can't be a git ref for COPY" in output, output
+    assert [f.kind for f in analyse.run(text, target="dead").findings] == [
+        "copy-remote-source"
+    ]

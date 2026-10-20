@@ -176,8 +176,6 @@ class TestSources:
         "line",
         [
             "COPY ${BUILD_DIR}/app /app",  # unresolved expansion
-            "ADD https://example.com/x.tar /x",  # fetched, never in the context
-            "ADD git@github.com:o/r.git /src",
             "COPY only-one-word",
             'COPY ["a.txt", 7]',
             "COPY 'unbalanced /dst",
@@ -187,10 +185,93 @@ class TestSources:
         """Half-reading an argument list is how a working COPY gets called dead."""
         assert self.sources(line) is None
 
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "ADD https://example.com/x.tar /x",  # fetched, never in the context
+            "ADD git@github.com:o/r.git /src",
+            "ADD git://example.com/o/r.git /src",
+        ],
+    )
+    def test_a_fetched_source_is_not_in_the_context_to_check(self, line):
+        """Empty, not None: nothing to check is a different claim from cannot read."""
+        assert self.sources(line) == []
+
+    def test_a_fetched_source_does_not_take_its_neighbours_with_it(self):
+        """Measured: the local operand of a mixed ADD is still a context read."""
+        assert self.sources("ADD local.txt https://e.com/o/r.git /dst/") == [
+            "local.txt"
+        ]
+
     def test_a_path_leaving_the_context_is_not_ours_to_judge(self):
         assert normalise("../outside.txt") is None
         assert normalise("a/../../out") is None
         assert normalise("a/../in.txt") == "in.txt"
+
+
+class TestRemoteShapes:
+    """Which source operands the builder fetches instead of reading.
+
+    Every case here is built for real in
+    `test_against_docker.py::test_is_remote_source_agrees_with_buildkit`.
+    These are the same table, asserted without a daemon so the rule stays
+    pinned where that half of the suite skips.
+    """
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "https://example.com/o/r.git",
+            "https://example.com/o/r.git#main",
+            "HTTPS://EXAMPLE.COM/o/r.git",  # the scheme is case-insensitive
+            "git://example.com/o/r.git",
+            "ssh://git@example.com/o/r.git",
+            "git@example.com:o/r.git",
+            "git@example.com:o/r",  # scp-style needs no .git suffix
+            "a@b:c",
+            "a@b-c.example.com:d",
+        ],
+    )
+    def test_a_git_ref_is_remote(self, source):
+        assert analyse.is_git_ref(source)
+        assert analyse.is_remote_source(source)
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "https://example.com/file.tar.gz",
+            "https://example.com/o/r",  # no .git: a download, not a clone
+            "https://example.com/o/r#main",  # a fragment is not enough either
+            "http://example.com/x",
+        ],
+    )
+    def test_a_url_is_remote_but_is_not_a_git_ref(self, source):
+        assert not analyse.is_git_ref(source)
+        assert analyse.is_remote_source(source)
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            ".git",  # the whole of logbook#47: a real directory
+            "foo.git",
+            "./foo.git",
+            "sub/thing.git",
+            "example.com/o/r.git",  # no scheme, so a path with dots in it
+            "example.com/o/r.git#main",
+            "example.com:8080/o/r.git",
+            "git+ssh://example.com/o/r.git",  # a scheme this BuildKit lacks
+            "git+http://example.com/o/r.git",
+            "has-colon:file.txt",
+            "my.user@example.com:o/r.git",  # a dot in the user part
+            "u@my_host:o/r.git",  # an underscore in the host
+            "dir/u@host:p",  # the shape has to start the operand
+            "./u@host:p",
+            "plain.txt",
+        ],
+    )
+    def test_everything_else_is_read_out_of_the_context(self, source):
+        assert not analyse.is_remote_source(source)
+        assert not analyse.is_git_ref(source)
 
 
 @pytest.fixture

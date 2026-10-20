@@ -115,6 +115,56 @@ jobs:
             exit 1
           fi
 
+      # logbook#47, asserted on the CLI rather than only in the suite: a real
+      # directory named .git, excluded the way near every repository excludes
+      # it. This was silent and exited 0 until the suffix guard was fixed, so
+      # it is the regression worth catching from outside the tests.
+      - name: a dockerignored COPY .git is reported, not silenced
+        run: |
+          set -euo pipefail
+          mkdir -p repro/.git
+          printf 'ref: refs/heads/main\n' > repro/.git/HEAD
+          printf '.git\n' > repro/.dockerignore
+          printf 'FROM alpine AS app\nCOPY .git /app/\nRUN use-it\n' \
+            > repro/Dockerfile
+          unbuilt repro/Dockerfile --context repro >git.txt && s=0 || s=$?
+          cat git.txt
+          test "$s" -eq 1
+          grep -qF 'dockerignored-copy' git.txt
+          grep -qF '.dockerignore line 1 (.git)' git.txt
+
+          # ...and the same directory with no rule against it stays silent.
+          rm repro/.dockerignore
+          unbuilt repro/Dockerfile --context repro | tee nogit.txt
+          grep -qF 'Every instruction has an effect on this build.' nogit.txt
+
+      # `COPY` cannot fetch. The quoted refusal is checked against the real
+      # builder in tests/test_against_docker.py; this checks a reader gets it
+      # from the CLI, and that the `ADD` that does work is left alone.
+      - name: a COPY of a git ref is reported and the ADD beside it is not
+        run: |
+          set -euo pipefail
+          url='https://github.com/moby/buildkit.git#v0.10.1'
+          printf 'FROM alpine AS app\nCOPY %s /b\nRUN use-it\n' "$url" \
+            > copyurl.Dockerfile
+          unbuilt copyurl.Dockerfile >url.txt && s=0 || s=$?
+          cat url.txt
+          test "$s" -eq 1
+          grep -qF 'copy-remote-source' url.txt
+
+          # The quoted refusal is asserted on -q, whose line is one finding
+          # and is not wrapped. The default output wraps at 78 columns and
+          # breaks the phrase in half, which is a true thing about the
+          # report and a false reason for this step to go red.
+          unbuilt -q copyurl.Dockerfile >quiet.txt && s=0 || s=$?
+          test "$s" -eq 1
+          grep -qF "source can't be a git ref for COPY" quiet.txt
+
+          printf 'FROM alpine AS app\nADD %s /b\nRUN use-it\n' "$url" \
+            > addurl.Dockerfile
+          unbuilt addurl.Dockerfile | tee add.txt
+          grep -qF 'Every instruction has an effect on this build.' add.txt
+
       - name: a clean Dockerfile exits 0 and says so
         run: |
           set -euo pipefail

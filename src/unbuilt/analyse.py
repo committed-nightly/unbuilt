@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import re
 import shlex
 from dataclasses import dataclass, field
 
@@ -331,13 +332,117 @@ def _copy_sources(graph: stages_module.Graph) -> list[Finding]:
     return findings
 
 
-#: `ADD` sources that are not paths in the build context, so `.dockerignore`
-#: never sees them. A remote source is fetched, not sent.
-_REMOTE_PREFIXES = ("http://", "https://", "git@", "ssh://", "git://")
+def _remote_copy_sources(
+    graph: stages_module.Graph,
+) -> tuple[list[Finding], list[Finding]]:
+    """`COPY` of something only `ADD` can fetch, which stops the build dead.
+
+    `COPY` has no fetching in it at all: a URL or a git ref as its source is
+    refused by the frontend before a single layer is built, with
+    `source can't be a git ref for COPY`. Nothing on disk and no flag
+    changes it, and there is no partial version of the failure.
+
+    Returns `(findings, notes)`, because unlike `copy-from-unknown` this one
+    follows the target: the refusal happens as a stage is converted, and a
+    stage the target does not build is never converted. Measured -- the same
+    line is a hard failure under `--target dead` and goes green while `dead`
+    is an orphan. That makes an unbuilt stage the one place this mistake can
+    *survive* in a repository, so it is a note rather than nothing: not
+    wrong for the build you asked about, fatal for the build that names it.
+    """
+    findings: list[Finding] = []
+    notes: list[Finding] = []
+    for stage in graph.stages:
+        for instruction in stage.instructions:
+            if instruction.keyword != "COPY" or instruction.raw_heredocs:
+                continue
+            sources = source_operands(instruction)
+            if sources is None:
+                continue
+            remote = [s for s in sources if is_remote_source(s)]
+            if not remote:
+                continue
+            which = (
+                f"{remote[0]} (and {len(remote) - 1} more)"
+                if len(remote) > 1
+                else remote[0]
+            )
+            shape = "a git ref" if is_git_ref(remote[0]) else "a URL"
+            quoted = "git ref" if is_git_ref(remote[0]) else "URL"
+            refusal = f"source can't be a {quoted} for COPY"
+            built = stage.index in graph.built
+            if built:
+                outcome = (
+                    f'BuildKit refuses this build with "{refusal}" before it '
+                    f"copies anything"
+                )
+            else:
+                outcome = (
+                    f"this target does not build {stage.label}, so the refusal "
+                    f'("{refusal}") waits for whatever does'
+                )
+            (findings if built else notes).append(
+                Finding(
+                    kind="copy-remote-source",
+                    line=instruction.line,
+                    stage=stage.label,
+                    detail=f"{which} is {shape}, and only ADD can fetch one -- {outcome}",
+                    instruction=_truncate(instruction.raw),
+                )
+            )
+    return findings, notes
 
 
-def copy_sources(instruction: Instruction) -> list[str] | None:
-    """The source operands of a `COPY`/`ADD`, or None if they cannot be read.
+#: A scheme the builder fetches rather than reads out of the build context.
+#: Case-insensitive: `ADD HTTPS://host/o/r.git` is fetched.
+_REMOTE_SCHEME = re.compile(r"^(?:(?P<git>git|ssh)|https?)://", re.IGNORECASE)
+
+#: `user@host:path`, which the builder reads as a repository over ssh. The
+#: charset is narrow and measured: a dot in the user part (`my.user@host:p`)
+#: or an underscore in the host (`u@my_host:p`) is read as a context path
+#: instead, and so is anything with the shape not at the very start of the
+#: operand (`dir/u@host:p`, `./u@host:p`).
+_SCP_LIKE = re.compile(r"^[A-Za-z0-9_-]+@[A-Za-z0-9.-]+:")
+
+
+def is_git_ref(source: str) -> bool:
+    """Whether the builder reads this source as a repository to clone.
+
+    The `.git` suffix only decides this for `http`/`https`, where it is the
+    whole of the rule -- `https://host/o/r` is an ordinary download and
+    `https://host/o/r.git` is a clone, fragment or no fragment. For every
+    other shape the suffix is not consulted at all, in either direction:
+    `git@host:o/r` is a clone without it, and a plain `foo.git` is a
+    directory in your context with it.
+    """
+    if _SCP_LIKE.match(source):
+        return True
+    scheme = _REMOTE_SCHEME.match(source)
+    if scheme is None:
+        return False
+    if scheme.group("git"):
+        return True
+    return source.partition("#")[0].endswith(".git")
+
+
+def is_remote_source(source: str) -> bool:
+    """Whether the builder fetches this source instead of reading the context.
+
+    Measured against docker 28.0.4 / buildx 0.38.0 rather than read off the
+    documentation, because the shapes that are *not* remote are the
+    surprising half and the cost of getting them wrong is silence. A
+    directory named `.git` or `foo.git`, a scheme-less `example.com/o/r.git`,
+    a `host:8080/o/r.git` and even a `git+ssh://host/o/r.git` are all read
+    out of the build context -- the last one because this BuildKit knows
+    `ssh://` and does not know `git+ssh://`, so it falls through to being a
+    path with a colon in it. Every shape in that table is built for real in
+    `tests/test_against_docker.py::test_is_remote_source_agrees_with_buildkit`.
+    """
+    return is_git_ref(source) or _REMOTE_SCHEME.match(source) is not None
+
+
+def source_operands(instruction: Instruction) -> list[str] | None:
+    """Every source operand of a `COPY`/`ADD` as written, or None if unreadable.
 
     None is the important return. A source built out of `${...}`, or a
     quoted path this cannot take apart, is one unbuilt must stay quiet about
@@ -367,9 +472,23 @@ def copy_sources(instruction: Instruction) -> list[str] | None:
     sources = words[:-1]
     if any("$" in s for s in sources):
         return None
-    if any(s.startswith(_REMOTE_PREFIXES) or s.endswith(".git") for s in sources):
-        return None
     return sources
+
+
+def copy_sources(instruction: Instruction) -> list[str] | None:
+    """The source operands read out of the build context, or None if unreadable.
+
+    A remote source is dropped on its own rather than taking the instruction
+    with it, because the builder treats the operands separately and so must
+    this: `ADD local.txt https://host/o/r.git /dst/` with `local.txt`
+    excluded fails on `local.txt`, measured, so the one operand
+    `.dockerignore` can speak to is still worth checking. An `ADD` whose
+    sources are *all* remote comes back empty and has nothing to check.
+    """
+    sources = source_operands(instruction)
+    if sources is None:
+        return None
+    return [s for s in sources if not is_remote_source(s)]
 
 
 def _blame(ignore: context_module.Ignore, path: str) -> str:
@@ -633,6 +752,9 @@ def run(
     result.findings.extend(_superseded(graph))
     result.findings.extend(_expansions(graph, globals_, strict))
     result.findings.extend(_copy_sources(graph))
+    remote_findings, remote_notes = _remote_copy_sources(graph)
+    result.findings.extend(remote_findings)
+    result.notes.extend(remote_notes)
     result.findings.extend(_unused_args(parsed.instructions, graph))
     if build is not None:
         result.findings.extend(_context_copies(graph, build, strict))
