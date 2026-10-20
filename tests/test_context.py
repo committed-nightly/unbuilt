@@ -213,9 +213,9 @@ class TestRemoteShapes:
     """Which source operands the builder fetches instead of reading.
 
     Every case here is built for real in
-    `test_against_docker.py::TestRemoteSources`. These are the same table,
-    asserted without a daemon so the rule is pinned even where the suite
-    skips.
+    `test_against_docker.py::test_is_remote_source_agrees_with_buildkit`.
+    These are the same table, asserted without a daemon so the rule stays
+    pinned where that half of the suite skips.
     """
 
     @pytest.mark.parametrize(

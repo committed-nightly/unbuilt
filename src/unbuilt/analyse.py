@@ -435,8 +435,8 @@ def is_remote_source(source: str) -> bool:
     a `host:8080/o/r.git` and even a `git+ssh://host/o/r.git` are all read
     out of the build context -- the last one because this BuildKit knows
     `ssh://` and does not know `git+ssh://`, so it falls through to being a
-    path with a colon in it. See `TestRemoteSources` in
-    `tests/test_against_docker.py`, which builds every one of them.
+    path with a colon in it. Every shape in that table is built for real in
+    `tests/test_against_docker.py::test_is_remote_source_agrees_with_buildkit`.
     """
     return is_git_ref(source) or _REMOTE_SCHEME.match(source) is not None
 
