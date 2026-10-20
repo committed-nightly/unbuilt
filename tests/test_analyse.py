@@ -367,14 +367,23 @@ def test_a_local_path_that_looks_remote_is_not_reported():
         assert only_remote(text) == [], source
 
 
-def test_a_stage_this_target_does_not_build_is_not_a_failure():
-    """Measured: an orphan stage is never converted, so the refusal never fires."""
+def test_a_stage_this_target_does_not_build_is_a_note_not_a_failure():
+    """Measured: an orphan stage is never converted, so the refusal never fires.
+
+    A note rather than silence, because a stage nothing builds is the only
+    place this mistake can sit in a repository without failing something.
+    """
     text = (
         "FROM alpine AS dead\nCOPY https://example.com/o/r.git /src\n"
         "FROM alpine AS f\nRUN a\n"
     )
     assert only_remote(text) == []
+    assert notes(text) == ["orphan-stage", "copy-remote-source"]
+    assert "does not build dead" in analyse.run(text).notes[1].detail
+
+    # ...and naming the stage makes it the failure it is.
     assert len(only_remote(text, target="dead")) == 1
+    assert "copy-remote-source" not in notes(text, target="dead")
 
 
 def test_several_remote_sources_on_one_line_report_once():

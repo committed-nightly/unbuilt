@@ -332,7 +332,9 @@ def _copy_sources(graph: stages_module.Graph) -> list[Finding]:
     return findings
 
 
-def _remote_copy_sources(graph: stages_module.Graph) -> list[Finding]:
+def _remote_copy_sources(
+    graph: stages_module.Graph,
+) -> tuple[list[Finding], list[Finding]]:
     """`COPY` of something only `ADD` can fetch, which stops the build dead.
 
     `COPY` has no fetching in it at all: a URL or a git ref as its source is
@@ -340,15 +342,17 @@ def _remote_copy_sources(graph: stages_module.Graph) -> list[Finding]:
     `source can't be a git ref for COPY`. Nothing on disk and no flag
     changes it, and there is no partial version of the failure.
 
-    Unlike `copy-from-unknown` this one follows the target, because the
-    refusal happens when the stage is converted and a stage the target does
-    not build is never converted. Measured: the same `COPY` is a hard
-    failure under `--target dead` and goes green when `dead` is an orphan.
+    Returns `(findings, notes)`, because unlike `copy-from-unknown` this one
+    follows the target: the refusal happens as a stage is converted, and a
+    stage the target does not build is never converted. Measured -- the same
+    line is a hard failure under `--target dead` and goes green while `dead`
+    is an orphan. That makes an unbuilt stage the one place this mistake can
+    *survive* in a repository, so it is a note rather than nothing: not
+    wrong for the build you asked about, fatal for the build that names it.
     """
-    findings = []
+    findings: list[Finding] = []
+    notes: list[Finding] = []
     for stage in graph.stages:
-        if stage.index not in graph.built:
-            continue
         for instruction in stage.instructions:
             if instruction.keyword != "COPY" or instruction.raw_heredocs:
                 continue
@@ -363,22 +367,30 @@ def _remote_copy_sources(graph: stages_module.Graph) -> list[Finding]:
                 if len(remote) > 1
                 else remote[0]
             )
-            kind = "a git ref" if is_git_ref(remote[0]) else "a URL"
+            shape = "a git ref" if is_git_ref(remote[0]) else "a URL"
             quoted = "git ref" if is_git_ref(remote[0]) else "URL"
-            findings.append(
+            refusal = f"source can't be a {quoted} for COPY"
+            built = stage.index in graph.built
+            if built:
+                outcome = (
+                    f'BuildKit refuses this build with "{refusal}" before it '
+                    f"copies anything"
+                )
+            else:
+                outcome = (
+                    f"this target does not build {stage.label}, so the refusal "
+                    f'("{refusal}") waits for whatever does'
+                )
+            (findings if built else notes).append(
                 Finding(
                     kind="copy-remote-source",
                     line=instruction.line,
                     stage=stage.label,
-                    detail=(
-                        f"{which} is {kind}, and only ADD can fetch one -- "
-                        f"BuildKit refuses this build with \"source can't be "
-                        f'a {quoted} for COPY" before it copies anything'
-                    ),
+                    detail=f"{which} is {shape}, and only ADD can fetch one -- {outcome}",
                     instruction=_truncate(instruction.raw),
                 )
             )
-    return findings
+    return findings, notes
 
 
 #: A scheme the builder fetches rather than reads out of the build context.
@@ -740,7 +752,9 @@ def run(
     result.findings.extend(_superseded(graph))
     result.findings.extend(_expansions(graph, globals_, strict))
     result.findings.extend(_copy_sources(graph))
-    result.findings.extend(_remote_copy_sources(graph))
+    remote_findings, remote_notes = _remote_copy_sources(graph)
+    result.findings.extend(remote_findings)
+    result.notes.extend(remote_notes)
     result.findings.extend(_unused_args(parsed.instructions, graph))
     if build is not None:
         result.findings.extend(_context_copies(graph, build, strict))

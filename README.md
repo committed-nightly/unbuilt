@@ -197,6 +197,7 @@ is the one that tells you not to trust the file.
 | `discarded-setting` | `ENV`, `USER`, `WORKDIR` or `SHELL` in such a stage, where nothing below it — in the stage or in any stage built `FROM` it — can read it. |
 | `superseded` | a setting a later line in the same stage replaces, with nothing in between that could have read the first one. |
 | `copy-from-unknown` | a `COPY --from=` naming no stage in the file, so Docker resolves it as an image. Names the closest stage if there is one. |
+| `copy-remote-source` | a `COPY` whose source is a URL or a git ref. Only `ADD` fetches; BuildKit refuses the build. A *note* in a stage this target does not build, where the refusal is waiting rather than happening. |
 | `dockerignored-copy` | a `COPY` or `ADD` whose sources `.dockerignore` keeps out of the build context. Needs `--context`. |
 | `unused-arg` | an `ARG` no build of this file can read. |
 | `orphan-stage` *(note)* | a stage no other stage builds `FROM` or copies out of. Only built if you name it with `--target`. |
@@ -254,13 +255,52 @@ Dockerfile at all. unbuilt says so on stderr, skips the context checks rather
 than guessing what the line meant, reports everything else as usual, and
 exits `2`.
 
+### What the builder fetches, and what it reads out of your context
+
+`ADD` can fetch a URL or clone a repository. `COPY` cannot do either, and a
+`COPY` that tries is not a warning — BuildKit refuses the build with
+`source can't be a git ref for COPY` before it builds a layer.
+
+Which sources those are is narrower than it looks, and unbuilt's answer is
+measured against `docker build` rather than read off the documentation
+(`tests/test_against_docker.py::test_is_remote_source_agrees_with_buildkit`
+builds all twenty shapes). It is **fetched** if it has a scheme BuildKit
+knows — `http`, `https`, `git`, `ssh` — or looks like `user@host:path`.
+Everything else is a path in your build context, including every one of
+these:
+
+| looks remote | actually | |
+|---|---|---|
+| `.git`, `foo.git` | a directory in your context | the `.git` suffix means nothing on its own |
+| `example.com/o/r.git` | a path with dots in it | no scheme, so no fetch |
+| `git+ssh://host/o/r.git` | a path with a colon in it | this BuildKit knows `ssh://` and not `git+ssh://` |
+| `my.user@host:o/r.git` | a path | the user part takes no dots |
+
+The suffix does decide one thing, and only one: for `http`/`https`,
+`.../o/r.git` is a clone and `.../o/r` is a download. A `#fragment` does not
+change that either way.
+
+`COPY .git /app` beside a `.dockerignore` that excludes `.git` is the pair of
+lines this matters for. It is a fatal build failure, both halves of it are
+common, and until this was measured unbuilt said nothing about it at all
+([logbook#47](https://github.com/committed-nightly/logbook/issues/47)).
+
 ### `--target`
 
-Most checks hold for any build of the file and run over every stage. Two do
-not: `discarded-metadata` and `discarded-setting` are statements about which
+Most checks hold for any build of the file and run over every stage. Three do
+not. `discarded-metadata` and `discarded-setting` are statements about which
 stage's configuration reaches the image, and that depends on what you are
-building. Those follow `--target`, defaulting to the last stage in the file,
-exactly as `docker build` does.
+building. `copy-remote-source` is one too, for a different reason: BuildKit
+refuses the `COPY` while it converts the stage, and a stage your target does
+not build is never converted — so the same line is fatal under
+`--target dead` and goes green while `dead` is an orphan. All three follow
+`--target`, defaulting to the last stage in the file, exactly as
+`docker build` does.
+
+`copy-remote-source` does not go quiet in the stages it is not fatal in; it
+drops to a note. An unbuilt stage is the one place a `COPY` of a URL can sit
+in a repository without failing anything, which makes it the one place
+you'd want telling about it.
 
 ```
 $ unbuilt --target build Dockerfile
