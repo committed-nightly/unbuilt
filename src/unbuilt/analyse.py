@@ -332,6 +332,55 @@ def _copy_sources(graph: stages_module.Graph) -> list[Finding]:
     return findings
 
 
+def _remote_copy_sources(graph: stages_module.Graph) -> list[Finding]:
+    """`COPY` of something only `ADD` can fetch, which stops the build dead.
+
+    `COPY` has no fetching in it at all: a URL or a git ref as its source is
+    refused by the frontend before a single layer is built, with
+    `source can't be a git ref for COPY`. Nothing on disk and no flag
+    changes it, and there is no partial version of the failure.
+
+    Unlike `copy-from-unknown` this one follows the target, because the
+    refusal happens when the stage is converted and a stage the target does
+    not build is never converted. Measured: the same `COPY` is a hard
+    failure under `--target dead` and goes green when `dead` is an orphan.
+    """
+    findings = []
+    for stage in graph.stages:
+        if stage.index not in graph.built:
+            continue
+        for instruction in stage.instructions:
+            if instruction.keyword != "COPY" or instruction.raw_heredocs:
+                continue
+            sources = source_operands(instruction)
+            if sources is None:
+                continue
+            remote = [s for s in sources if is_remote_source(s)]
+            if not remote:
+                continue
+            which = (
+                f"{remote[0]} (and {len(remote) - 1} more)"
+                if len(remote) > 1
+                else remote[0]
+            )
+            kind = "a git ref" if is_git_ref(remote[0]) else "a URL"
+            quoted = "git ref" if is_git_ref(remote[0]) else "URL"
+            findings.append(
+                Finding(
+                    kind="copy-remote-source",
+                    line=instruction.line,
+                    stage=stage.label,
+                    detail=(
+                        f"{which} is {kind}, and only ADD can fetch one -- "
+                        f"BuildKit refuses this build with \"source can't be "
+                        f'a {quoted} for COPY" before it copies anything'
+                    ),
+                    instruction=_truncate(instruction.raw),
+                )
+            )
+    return findings
+
+
 #: A scheme the builder fetches rather than reads out of the build context.
 #: Case-insensitive: `ADD HTTPS://host/o/r.git` is fetched.
 _REMOTE_SCHEME = re.compile(r"^(?:(?P<git>git|ssh)|https?)://", re.IGNORECASE)
@@ -691,6 +740,7 @@ def run(
     result.findings.extend(_superseded(graph))
     result.findings.extend(_expansions(graph, globals_, strict))
     result.findings.extend(_copy_sources(graph))
+    result.findings.extend(_remote_copy_sources(graph))
     result.findings.extend(_unused_args(parsed.instructions, graph))
     if build is not None:
         result.findings.extend(_context_copies(graph, build, strict))
