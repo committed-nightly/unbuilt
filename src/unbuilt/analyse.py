@@ -618,7 +618,7 @@ def _source_verdict(
 
 
 def _dockerignored(
-    instruction: Instruction, stage: stages_module.Stage, dead, is_built: bool = True
+    instruction: Instruction, stage: stages_module.Stage, dead, is_built: bool
 ) -> Finding:
     written, blamed, is_pattern = dead[0]
     which = f"{written} (and {len(dead) - 1} more)" if len(dead) > 1 else written
@@ -638,7 +638,7 @@ def _dockerignored(
     else:
         outcome = (
             f"and this target does not build {stage.label}, so the failure "
-            f"it causes ('failed to compute cache key') waits for whatever does"
+            "it causes ('failed to compute cache key') waits for whatever does"
         )
     return Finding(
         kind="dockerignored-copy",
