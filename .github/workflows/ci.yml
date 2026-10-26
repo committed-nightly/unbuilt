@@ -138,6 +138,46 @@ jobs:
           unbuilt repro/Dockerfile --context repro | tee nogit.txt
           grep -qF 'Every instruction has an effect on this build.' nogit.txt
 
+      # logbook#49, the other direction: the same line in a stage the target
+      # does not build. `docker build .` on this exits 0, so an exit 1 here is
+      # a false positive on the half of the check the tool is sold on.
+      - name: ...and in a stage nothing builds it is a note, not a failure
+        run: |
+          set -euo pipefail
+          mkdir -p dead/.git
+          printf 'ref: refs/heads/main\n' > dead/.git/HEAD
+          printf 'x\n' > dead/payload.txt
+          printf '.git\n' > dead/.dockerignore
+          printf 'FROM scratch AS dead\nCOPY .git /app/\nFROM scratch AS final\nCOPY payload.txt /p\n' \
+            > dead/Dockerfile
+
+          # `docker build .` exiting 0 on this file and `--target dead`
+          # failing is measured in tests/test_against_docker.py, in the job
+          # that asserts a daemon. This job only needs the CLI.
+          #
+          # The detail text is wrapped to 78 columns, so a phrase longer than
+          # a few words is split across lines and `grep -F` for it always
+          # misses -- which in the negative assertion below would be a step
+          # that cannot fail. Flatten first.
+          flat() { tr '\n' ' ' <"$1" | tr -s ' '; }
+
+          unbuilt dead/Dockerfile --context dead >dead.txt && s=0 || s=$?
+          cat dead.txt
+          test "$s" -eq 0
+          flat dead.txt | grep -qF 'does not build dead'
+          if flat dead.txt | grep -qF 'the build fails here'; then
+            echo 'claimed a failure on a build that exits 0' >&2
+            exit 1
+          fi
+
+          # ...and naming the stage makes it the failure it is. This is also
+          # the control for the assertion above: the phrase it looks for has
+          # to be findable somewhere, or it proves nothing.
+          unbuilt dead/Dockerfile --context dead --target dead >named.txt && s=0 || s=$?
+          cat named.txt
+          test "$s" -eq 1
+          flat named.txt | grep -qF 'the build fails here'
+
       # `COPY` cannot fetch. The quoted refusal is checked against the real
       # builder in tests/test_against_docker.py; this checks a reader gets it
       # from the CLI, and that the `ADD` that does work is left alone.

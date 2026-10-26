@@ -314,9 +314,9 @@ class TestContextResolution:
 class TestVerdicts:
     """What `--context` turns into findings, with the context on disk."""
 
-    def analyse(self, tree, ignore, dockerfile, strict=False):
+    def analyse(self, tree, ignore, dockerfile, strict=False, target=None):
         context = tree(ignore)
-        result = analyse.run(dockerfile, build=context, strict=strict)
+        result = analyse.run(dockerfile, build=context, strict=strict, target=target)
         return [(f.kind, f.line) for f in result.findings], [
             (n.kind, n.line) for n in result.notes
         ]
@@ -356,6 +356,72 @@ class TestVerdicts:
             tree, "*.key", "FROM scratch\nCOPY *.key src/*.go /dst/\n"
         )
         assert findings == []
+
+    def test_the_fatal_half_follows_the_target(self, tree):
+        """logbook#49. The refusal happens as a stage is converted.
+
+        A stage the target does not build is never converted, so "the build
+        fails here" is false there -- measured against a real builder in
+        `test_against_docker.py`. A note rather than silence: an unbuilt
+        stage is the one place this mistake can sit in a repository.
+        """
+        text = (
+            "FROM scratch AS dead\nCOPY dist /app/\n"
+            "FROM scratch AS final\nCOPY README.md /r\n"
+        )
+        findings, notes = self.analyse(tree, "dist", text)
+        assert findings == []
+        assert notes == [("orphan-stage", 1), ("dockerignored-copy", 2)]
+
+        result = analyse.run(text, build=tree("dist"))
+        assert "does not build dead" in result.notes[1].detail
+        assert "the build fails here" not in result.notes[1].detail
+
+    def test_and_naming_that_stage_makes_it_the_failure_it_is(self, tree):
+        text = (
+            "FROM scratch AS dead\nCOPY dist /app/\n"
+            "FROM scratch AS final\nCOPY README.md /r\n"
+        )
+        findings, _ = self.analyse(tree, "dist", text, target="dead")
+        assert findings == [("dockerignored-copy", 2)]
+
+        result = analyse.run(text, build=tree("dist"), target="dead")
+        assert "the build fails here" in result.findings[0].detail
+
+    def test_a_dead_pattern_is_a_finding_in_any_stage(self, tree):
+        """The pattern half claims no failure, so it has no target to follow.
+
+        `COPY *.key /secrets/` with every match excluded copies no files in
+        any build of this file, and fails none of them. That is unbuilt's
+        own claim, so it stays a finding where the fatal half drops to a note.
+        """
+        text = (
+            "FROM scratch AS dead\nCOPY *.key /secrets/\n"
+            "FROM scratch AS final\nCOPY README.md /r\n"
+        )
+        findings, notes = self.analyse(tree, "*.key", text)
+        assert findings == [("dockerignored-copy", 2)]
+        assert notes == [("orphan-stage", 1)]
+
+    def test_the_note_is_not_just_orphan_stage_in_other_words(self, tree):
+        """A stage another stage names, in a branch of the file nothing builds.
+
+        `base` is referenced by `tools`, so `orphan-stage` says nothing about
+        it -- and `--target tools` is a real thing to run. Without the note,
+        the fatal `COPY` in it is reported by nothing at all.
+        """
+        text = (
+            "FROM scratch AS base\nCOPY dist /app/\n"
+            "FROM base AS tools\nCOPY README.md /r\n"
+            "FROM scratch AS final\nCOPY README.md /r\n"
+        )
+        findings, notes = self.analyse(tree, "dist", text)
+        assert findings == []
+        assert notes == [("dockerignored-copy", 2), ("orphan-stage", 3)]
+
+        # ...and it is fatal for the build that does name it.
+        findings, _ = self.analyse(tree, "dist", text, target="tools")
+        assert findings == [("dockerignored-copy", 2)]
 
     @pytest.mark.parametrize("source", [".", "./", "/"])
     def test_copying_the_whole_context_is_never_reported(self, tree, source):

@@ -198,7 +198,7 @@ is the one that tells you not to trust the file.
 | `superseded` | a setting a later line in the same stage replaces, with nothing in between that could have read the first one. |
 | `copy-from-unknown` | a `COPY --from=` naming no stage in the file, so Docker resolves it as an image. Names the closest stage if there is one. |
 | `copy-remote-source` | a `COPY` whose source is a URL or a git ref. Only `ADD` fetches; BuildKit refuses the build. A *note* in a stage this target does not build, where the refusal is waiting rather than happening. |
-| `dockerignored-copy` | a `COPY` or `ADD` whose sources `.dockerignore` keeps out of the build context. Needs `--context`. |
+| `dockerignored-copy` | a `COPY` or `ADD` whose sources `.dockerignore` keeps out of the build context. Needs `--context`. A *note* when an excluded **name** sits in a stage this target does not build, where the failure is waiting rather than happening. |
 | `unused-arg` | an `ARG` no build of this file can read. |
 | `orphan-stage` *(note)* | a stage no other stage builds `FROM` or copies out of. Only built if you name it with `--target`. |
 
@@ -237,6 +237,14 @@ finding:
 - A **pattern** left with nothing to match **succeeds, having copied
   nothing**. No file lands, the destination directory is not even created,
   and the build goes green. This is the one worth owning the tool for.
+
+Which is also why only the first half follows `--target`. The failure happens
+as the stage is converted, so put that `COPY .git` in a stage your target does
+not build and the build is green — same file, same rule, same line. unbuilt
+drops it to a note there rather than claiming a failure that is not going to
+happen, and makes it a finding again under `--target dead`. The pattern half
+has nothing to follow: it copies no files and fails nothing in any build of
+the file, so it is a finding wherever it sits.
 
 **You have to pass `--context`, and unbuilt will not guess it.** The context
 is `docker build`'s last argument and it is routinely not the directory the
@@ -287,20 +295,22 @@ common, and until this was measured unbuilt said nothing about it at all
 
 ### `--target`
 
-Most checks hold for any build of the file and run over every stage. Three do
+Most checks hold for any build of the file and run over every stage. Four do
 not. `discarded-metadata` and `discarded-setting` are statements about which
 stage's configuration reaches the image, and that depends on what you are
 building. `copy-remote-source` is one too, for a different reason: BuildKit
 refuses the `COPY` while it converts the stage, and a stage your target does
 not build is never converted — so the same line is fatal under
-`--target dead` and goes green while `dead` is an orphan. All three follow
-`--target`, defaulting to the last stage in the file, exactly as
-`docker build` does.
+`--target dead` and goes green while `dead` is an orphan. The fatal half of
+`dockerignored-copy` is the same case with a different message: an excluded
+**name** fails the conversion with `failed to compute cache key`, and in an
+unbuilt stage it does not fail at all. All four follow `--target`, defaulting
+to the last stage in the file, exactly as `docker build` does.
 
-`copy-remote-source` does not go quiet in the stages it is not fatal in; it
-drops to a note. An unbuilt stage is the one place a `COPY` of a URL can sit
-in a repository without failing anything, which makes it the one place
-you'd want telling about it.
+Neither of those two goes quiet in the stages it is not fatal in; both drop to
+a note. An unbuilt stage is the one place a `COPY` of a URL, or of a file your
+`.dockerignore` excludes, can sit in a repository without failing anything —
+which makes it the one place you'd want telling about it.
 
 ```
 $ unbuilt --target build Dockerfile
