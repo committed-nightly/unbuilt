@@ -700,6 +700,67 @@ def test_a_dockerignored_dot_git_directory_fails_the_build(build, tmp_path):
 
 
 @needs_docker
+def test_the_same_copy_in_a_stage_nothing_builds_is_not_a_failure(build, tmp_path):
+    """logbook#49, and the reason the fatal half follows `--target`.
+
+    Identical file, identical ignore rule, identical `COPY`. Moving it into
+    a stage the target does not build takes the build from `failed to
+    compute cache key` to exit 0, because the refusal happens as a stage is
+    converted and an unbuilt stage is never converted. unbuilt's exit code
+    has to match the builder's in both directions.
+    """
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    (tmp_path / ".dockerignore").write_text(".git\n")
+    text = (
+        "FROM scratch AS dead\nCOPY .git /app/\n"
+        "\nFROM scratch AS final\nCOPY payload.txt /payload\n"
+    )
+
+    ok, output, _ = build(text)
+    assert ok, output
+    result = analyse.run(text, build=context.open_context(tmp_path))
+    assert result.findings == []
+    # Not a finding, and not silence either: a stage nothing builds is where
+    # this mistake can sit in a repository without failing anything.
+    assert [n.kind for n in result.notes] == ["orphan-stage", "dockerignored-copy"]
+
+    ok, output, _ = build(text, "--target", "dead")
+    assert not ok
+    assert "failed to compute cache key" in output, output
+    named = analyse.run(text, build=context.open_context(tmp_path), target="dead")
+    assert [f.kind for f in named.findings] == ["dockerignored-copy"]
+
+
+@needs_docker
+def test_a_dead_pattern_in_such_a_stage_is_green_under_either_target(build, tmp_path):
+    """Which is why the pattern half has no target to follow.
+
+    The fatal half changes answer when you name the stage. This one cannot:
+    a pattern with nothing left to match copies nothing and fails nothing,
+    whichever stage it is in and whichever stage you ask for. So it stays a
+    finding in both, where the fatal half drops to a note in one.
+    """
+    (tmp_path / ".dockerignore").write_text("*.key\n")
+    (tmp_path / "secret.key").write_text("hunter2\n")
+    text = (
+        "FROM scratch AS dead\nCOPY *.key /secrets/\n"
+        "\nFROM scratch AS final\nCOPY payload.txt /payload\n"
+    )
+
+    for args in ((), ("--target", "dead")):
+        ok, output, _ = build(text, *args)
+        assert ok, f"{args}: {output}"
+
+    for target in (None, "dead"):
+        result = analyse.run(
+            text, build=context.open_context(tmp_path), target=target
+        )
+        kinds = [f.kind for f in result.findings]
+        assert kinds == ["dockerignored-copy"], target
+
+
+@needs_docker
 def test_the_same_directory_with_no_rule_against_it_is_copied(build, tmp_path):
     """The other direction, which is what makes the finding above safe."""
     (tmp_path / "foo.git").mkdir()
