@@ -507,11 +507,21 @@ def _blame(ignore: context_module.Ignore, path: str) -> str:
 
 def _context_copies(
     graph: stages_module.Graph, build: context_module.Context, strict: bool
-) -> list[Finding]:
+) -> tuple[list[Finding], list[Finding]]:
     """`COPY` and `ADD` read against the context the builder would be sent.
 
-    Target-independent, like `copy-from-unknown`: a source `.dockerignore`
-    removes is removed from every build of the file.
+    Whether a source is *sent* is target-independent: a `.dockerignore` line
+    removes it from every build of the file. Whether the build **fails** is
+    not, and the fatal half of this check claims the second thing -- so that
+    half follows `--target`, like `copy-remote-source`. A named source with
+    nothing behind it fails as its stage is converted, and a stage the target
+    does not build is never converted. Measured (logbook#49): the same
+    `COPY .git` is `failed to compute cache key` under `--target dead` and
+    exits 0 while `dead` is an orphan, so in an unbuilt stage it is a note.
+
+    A dead *pattern* fails nothing in any build, so it stays a finding
+    wherever it sits. "This instruction copies no files" is the claim unbuilt
+    exists to make and it is true of every build of the file.
 
     `--from=` is skipped outright and that is not an oversight. A
     `COPY --from=build /app/dist` reads the *stage's* filesystem, which the
@@ -520,9 +530,11 @@ def _context_copies(
     been the loudest possible false positive.
     """
     findings: list[Finding] = []
+    notes: list[Finding] = []
     ignore = build.ignore
 
     for stage in graph.stages:
+        is_built = stage.index in graph.built
         for instruction in stage.instructions:
             if instruction.keyword not in ("COPY", "ADD"):
                 continue
@@ -554,13 +566,16 @@ def _context_copies(
             # enough, where one dead pattern is not.
             fatal = [entry for entry in dead if not entry[2]]
             if fatal:
-                findings.append(_dockerignored(instruction, stage, fatal))
+                # ...in a stage this target builds. In one it does not, the
+                # failure is waiting rather than happening.
+                where = findings if is_built else notes
+                where.append(_dockerignored(instruction, stage, fatal, is_built))
             elif dead and not (alive or missing):
-                findings.append(_dockerignored(instruction, stage, dead))
+                findings.append(_dockerignored(instruction, stage, dead, is_built))
             elif missing and not alive and strict:
                 findings.append(_missing_sources(instruction, stage, missing))
 
-    return findings
+    return findings, notes
 
 
 def _source_verdict(
@@ -603,21 +618,27 @@ def _source_verdict(
 
 
 def _dockerignored(
-    instruction: Instruction, stage: stages_module.Stage, dead
+    instruction: Instruction, stage: stages_module.Stage, dead, is_built: bool = True
 ) -> Finding:
     written, blamed, is_pattern = dead[0]
     which = f"{written} (and {len(dead) - 1} more)" if len(dead) > 1 else written
     if is_pattern:
         # Measured: a pattern left with nothing to match is not an error.
         # The build goes green having created nothing at the destination.
+        # True of any build, so `is_built` does not come into it.
         outcome = (
             "so this instruction matches nothing and the build copies no files "
             "here, without failing"
         )
-    else:
+    elif is_built:
         outcome = (
             "so the build fails here -- a named source that is not in the "
             "context is not a warning, it is 'failed to compute cache key'"
+        )
+    else:
+        outcome = (
+            f"and this target does not build {stage.label}, so the failure "
+            f"it causes ('failed to compute cache key') waits for whatever does"
         )
     return Finding(
         kind="dockerignored-copy",
@@ -757,7 +778,9 @@ def run(
     result.notes.extend(remote_notes)
     result.findings.extend(_unused_args(parsed.instructions, graph))
     if build is not None:
-        result.findings.extend(_context_copies(graph, build, strict))
+        context_findings, context_notes = _context_copies(graph, build, strict)
+        result.findings.extend(context_findings)
+        result.notes.extend(context_notes)
     result.findings.sort(key=lambda f: (f.line, f.kind))
     result.notes.sort(key=lambda f: (f.line, f.kind))
     result.skipped_stages = [
