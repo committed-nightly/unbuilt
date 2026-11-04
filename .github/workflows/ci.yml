@@ -120,6 +120,13 @@ jobs:
           test "$s" -eq 2
           grep -qF 'unterminated [' err.txt
           grep -qxF 'Every instruction has an effect on this build.' out.txt
+
+          # The control for the guard below. `unbuilt: ` is the diagnostic
+          # prefix, and the guard only means something while that is true --
+          # rename the prefix and the guard passes forever on an empty search,
+          # protecting nothing. Asserting it on stderr first is what makes its
+          # absence from stdout evidence rather than coincidence.
+          grep -qF 'unbuilt: ' err.txt
           if grep -qF 'unbuilt: ' out.txt; then
             echo 'the diagnostic reached stdout' >&2
             exit 1
@@ -242,6 +249,10 @@ jobs:
             esac
             test "$status" -eq 2
             grep -qF 'no stage named buidler' err.txt
+            # ...prefixed, which is the control for no_diagnostic_on_stdout
+            # below: that guard searches stdout for `unbuilt: ` and is only
+            # evidence while `unbuilt: ` is a string this program still emits.
+            grep -qF 'unbuilt: ' err.txt
           done
 
           # ...and it is *not* on stdout in the two modes whose stdout is for
