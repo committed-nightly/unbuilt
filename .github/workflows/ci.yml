@@ -43,6 +43,16 @@ jobs:
   dogfood:
     # The README quotes this run. If the example or the tool changes, this is
     # the job that notices before a reader does.
+    #
+    # `-qxF` is the whole-line form and is deliberate wherever the pattern is
+    # a complete line of output -- the summary verdicts and the counts. With
+    # plain `-qF` the match is a substring, so appending anything to a summary
+    # line leaves these steps green while they stop asserting the sentence
+    # they name, which is exactly the edit logbook#59 asks for. `-qF` stays
+    # for the things that genuinely are substrings: finding kinds, quoted
+    # phrases out of wrapped detail text, and stderr diagnostics. See
+    # logbook#63, and the `assertions` job below, which fails if a whole-line
+    # pattern loses its `-x` again.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -57,8 +67,8 @@ jobs:
           unbuilt examples/Dockerfile > out.txt && status=0 || status=$?
           cat out.txt
           test "$status" -eq 1
-          grep -qF 'Not built for this target: build, test.' out.txt
-          grep -qF '4 instructions with no effect on this build.' out.txt
+          grep -qxF 'Not built for this target: build, test.' out.txt
+          grep -qxF '4 instructions with no effect on this build.' out.txt
           for kind in unused-arg empty-expansion superseded \
                       copy-from-unknown orphan-stage; do
             grep -qF "$kind" out.txt
@@ -73,7 +83,7 @@ jobs:
           unbuilt examples/Dockerfile --context examples >ctx.txt && s=0 || s=$?
           cat ctx.txt
           test "$s" -eq 1
-          grep -qF '5 instructions with no effect on this build.' ctx.txt
+          grep -qxF '5 instructions with no effect on this build.' ctx.txt
           grep -qF 'dockerignored-copy' ctx.txt
           grep -qF '.dockerignore line 10 (*lock*)' ctx.txt
 
@@ -81,7 +91,7 @@ jobs:
           # the README quotes is the one that must not move.
           unbuilt examples/Dockerfile >plain.txt && s=0 || s=$?
           test "$s" -eq 1
-          grep -qF '4 instructions with no effect on this build.' plain.txt
+          grep -qxF '4 instructions with no effect on this build.' plain.txt
           if grep -qF 'dockerignored-copy' plain.txt; then
             echo 'the context check ran without --context' >&2
             exit 1
@@ -100,7 +110,7 @@ jobs:
           printf 'FROM alpine AS app\nCOPY . /app\nCOPY src/*.js /app/\nRUN go\n' \
             > ctx/Dockerfile
           unbuilt ctx/Dockerfile --context ctx | tee quiet.txt
-          grep -qF 'Every instruction has an effect on this build.' quiet.txt
+          grep -qxF 'Every instruction has an effect on this build.' quiet.txt
 
       - name: a .dockerignore docker rejects exits 2 and still reports the file
         run: |
@@ -109,7 +119,7 @@ jobs:
           unbuilt ctx/Dockerfile --context ctx >out.txt 2>err.txt && s=0 || s=$?
           test "$s" -eq 2
           grep -qF 'unterminated [' err.txt
-          grep -qF 'Every instruction has an effect on this build.' out.txt
+          grep -qxF 'Every instruction has an effect on this build.' out.txt
           if grep -qF 'unbuilt: ' out.txt; then
             echo 'the diagnostic reached stdout' >&2
             exit 1
@@ -136,7 +146,7 @@ jobs:
           # ...and the same directory with no rule against it stays silent.
           rm repro/.dockerignore
           unbuilt repro/Dockerfile --context repro | tee nogit.txt
-          grep -qF 'Every instruction has an effect on this build.' nogit.txt
+          grep -qxF 'Every instruction has an effect on this build.' nogit.txt
 
       # logbook#49, the other direction: the same line in a stage the target
       # does not build. `docker build .` on this exits 0, so an exit 1 here is
@@ -203,14 +213,14 @@ jobs:
           printf 'FROM alpine AS app\nADD %s /b\nRUN use-it\n' "$url" \
             > addurl.Dockerfile
           unbuilt addurl.Dockerfile | tee add.txt
-          grep -qF 'Every instruction has an effect on this build.' add.txt
+          grep -qxF 'Every instruction has an effect on this build.' add.txt
 
       - name: a clean Dockerfile exits 0 and says so
         run: |
           set -euo pipefail
           printf 'FROM alpine AS app\nENV A=1\nRUN use-it\n' > clean.Dockerfile
           unbuilt clean.Dockerfile | tee clean.txt
-          grep -qF 'Every instruction has an effect on this build.' clean.txt
+          grep -qxF 'Every instruction has an effect on this build.' clean.txt
 
       # The README's "When --target names no stage" section, asserted on the
       # channel it is about: a typo must not be able to reach stdout-only
