@@ -28,7 +28,13 @@ jobs:
         run: docker info --format 'server {{.ServerVersion}}'
 
       - run: pip install -e ".[dev]"
-      - run: pytest -q
+
+      # Not `pytest -q`: pyproject's addopts is already `-q`, and the two
+      # together are `-qq`, which drops the `N passed` line entirely and
+      # leaves a wall of dots as the whole evidence this job produces. That
+      # also makes the step's output unreadable by anything downstream.
+      # logbook#52.
+      - run: pytest
 
   lint:
     runs-on: ubuntu-latest
@@ -39,6 +45,56 @@ jobs:
           python-version: '3.12'
       - run: pip install ruff
       - run: ruff check .
+
+  assertions:
+    # Every other job in this file asserts something about unbuilt. This one
+    # asserts that those assertions can fail.
+    #
+    # deadassert reads the `run:` scripts here and reports the greps that pass
+    # whether or not the thing they name is true: a whole summary line matched
+    # as a substring, and a negated guard searching for a string nothing
+    # establishes is ever produced. There were ten of those in this file
+    # (logbook#64) and this job is what stops them coming back.
+    #
+    # What it will not catch: greps inside shell function bodies, which
+    # deadassert does not descend into. `no_diagnostic_on_stdout` in the
+    # dogfood job is one of those, and had this exact bug. So read a clean run
+    # as covering the top level of each script, not the whole file.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install git+https://github.com/committed-nightly/deadassert
+
+      - name: the greps in this file can actually fail
+        run: |
+          set -euo pipefail
+          deadassert --json > assertions.json && status=0 || status=$?
+          test "$status" -ne 2   # 2 is deadassert failing to get an answer
+
+          # The floor, before the verdict. logbook#59: "no findings" is only
+          # evidence if something was read, and the one failure that would
+          # make this job green and worthless is extraction quietly returning
+          # nothing. 25 assertions in 17 scripts when this job was added, so
+          # 20 is a floor and not a pin -- it is meant to survive ordinary
+          # edits to this file and not to survive deadassert going blind.
+          python3 - <<'PY'
+          import json, sys
+
+          d = json.load(open("assertions.json"))
+          found, negated = d["assertions"], d["negated"]
+          print(f"read {found} assertions in {d['scripts']} scripts, {negated} negated")
+          if found < 20:
+              sys.exit(f"deadassert read {found} assertions, expected >= 20: this job tested nothing")
+          if negated < 1:
+              sys.exit("no negated assertions read, so the unwitnessed check had nothing to work on")
+          PY
+
+          # Prints the findings if there are any, and exits 1 with them in the
+          # log rather than leaving a bare exit code to interpret.
+          deadassert
 
   dogfood:
     # The README quotes this run. If the example or the tool changes, this is
