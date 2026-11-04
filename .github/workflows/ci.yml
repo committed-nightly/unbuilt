@@ -28,7 +28,13 @@ jobs:
         run: docker info --format 'server {{.ServerVersion}}'
 
       - run: pip install -e ".[dev]"
-      - run: pytest -q
+
+      # Not `pytest -q`: pyproject's addopts is already `-q`, and the two
+      # together are `-qq`, which drops the `N passed` line entirely and
+      # leaves a wall of dots as the whole evidence this job produces. That
+      # also makes the step's output unreadable by anything downstream.
+      # logbook#52.
+      - run: pytest
 
   lint:
     runs-on: ubuntu-latest
@@ -40,9 +46,69 @@ jobs:
       - run: pip install ruff
       - run: ruff check .
 
+  assertions:
+    # Every other job in this file asserts something about unbuilt. This one
+    # asserts that those assertions can fail.
+    #
+    # deadassert reads the `run:` scripts here and reports the greps that pass
+    # whether or not the thing they name is true: a whole summary line matched
+    # as a substring, and a negated guard searching for a string nothing
+    # establishes is ever produced. There were ten of those in this file
+    # (logbook#64) and this job is what stops them coming back.
+    #
+    # What it will not catch: greps inside shell function bodies, which
+    # deadassert does not descend into. `no_diagnostic_on_stdout` in the
+    # dogfood job is one of those, and had this exact bug. So read a clean run
+    # as covering the top level of each script, not the whole file.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install git+https://github.com/committed-nightly/deadassert
+
+      - name: the greps in this file can actually fail
+        run: |
+          set -euo pipefail
+          deadassert --json > assertions.json && status=0 || status=$?
+          test "$status" -ne 2   # 2 is deadassert failing to get an answer
+
+          # The floor, before the verdict. logbook#59: "no findings" is only
+          # evidence if something was read, and the one failure that would
+          # make this job green and worthless is extraction quietly returning
+          # nothing. 25 assertions in 17 scripts when this job was added, so
+          # 20 is a floor and not a pin -- it is meant to survive ordinary
+          # edits to this file and not to survive deadassert going blind.
+          python3 - <<'PY'
+          import json, sys
+
+          d = json.load(open("assertions.json"))
+          found, negated = d["assertions"], d["negated"]
+          print(f"read {found} assertions in {d['scripts']} scripts, {negated} negated")
+          if found < 20:
+              sys.exit(f"deadassert read {found} assertions, expected >= 20: this job tested nothing")
+          if negated < 1:
+              sys.exit("no negated assertions read, so the unwitnessed check had nothing to work on")
+          PY
+
+          # Prints the findings if there are any, and exits 1 with them in the
+          # log rather than leaving a bare exit code to interpret.
+          deadassert
+
   dogfood:
     # The README quotes this run. If the example or the tool changes, this is
     # the job that notices before a reader does.
+    #
+    # `-qxF` is the whole-line form and is deliberate wherever the pattern is
+    # a complete line of output -- the summary verdicts and the counts. With
+    # plain `-qF` the match is a substring, so appending anything to a summary
+    # line leaves these steps green while they stop asserting the sentence
+    # they name, which is exactly the edit logbook#59 asks for. `-qF` stays
+    # for the things that genuinely are substrings: finding kinds, quoted
+    # phrases out of wrapped detail text, and stderr diagnostics. See
+    # logbook#63, and the `assertions` job below, which fails if a whole-line
+    # pattern loses its `-x` again.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -57,8 +123,8 @@ jobs:
           unbuilt examples/Dockerfile > out.txt && status=0 || status=$?
           cat out.txt
           test "$status" -eq 1
-          grep -qF 'Not built for this target: build, test.' out.txt
-          grep -qF '4 instructions with no effect on this build.' out.txt
+          grep -qxF 'Not built for this target: build, test.' out.txt
+          grep -qxF '4 instructions with no effect on this build.' out.txt
           for kind in unused-arg empty-expansion superseded \
                       copy-from-unknown orphan-stage; do
             grep -qF "$kind" out.txt
@@ -73,7 +139,7 @@ jobs:
           unbuilt examples/Dockerfile --context examples >ctx.txt && s=0 || s=$?
           cat ctx.txt
           test "$s" -eq 1
-          grep -qF '5 instructions with no effect on this build.' ctx.txt
+          grep -qxF '5 instructions with no effect on this build.' ctx.txt
           grep -qF 'dockerignored-copy' ctx.txt
           grep -qF '.dockerignore line 10 (*lock*)' ctx.txt
 
@@ -81,7 +147,7 @@ jobs:
           # the README quotes is the one that must not move.
           unbuilt examples/Dockerfile >plain.txt && s=0 || s=$?
           test "$s" -eq 1
-          grep -qF '4 instructions with no effect on this build.' plain.txt
+          grep -qxF '4 instructions with no effect on this build.' plain.txt
           if grep -qF 'dockerignored-copy' plain.txt; then
             echo 'the context check ran without --context' >&2
             exit 1
@@ -100,7 +166,7 @@ jobs:
           printf 'FROM alpine AS app\nCOPY . /app\nCOPY src/*.js /app/\nRUN go\n' \
             > ctx/Dockerfile
           unbuilt ctx/Dockerfile --context ctx | tee quiet.txt
-          grep -qF 'Every instruction has an effect on this build.' quiet.txt
+          grep -qxF 'Every instruction has an effect on this build.' quiet.txt
 
       - name: a .dockerignore docker rejects exits 2 and still reports the file
         run: |
@@ -109,7 +175,14 @@ jobs:
           unbuilt ctx/Dockerfile --context ctx >out.txt 2>err.txt && s=0 || s=$?
           test "$s" -eq 2
           grep -qF 'unterminated [' err.txt
-          grep -qF 'Every instruction has an effect on this build.' out.txt
+          grep -qxF 'Every instruction has an effect on this build.' out.txt
+
+          # The control for the guard below. `unbuilt: ` is the diagnostic
+          # prefix, and the guard only means something while that is true --
+          # rename the prefix and the guard passes forever on an empty search,
+          # protecting nothing. Asserting it on stderr first is what makes its
+          # absence from stdout evidence rather than coincidence.
+          grep -qF 'unbuilt: ' err.txt
           if grep -qF 'unbuilt: ' out.txt; then
             echo 'the diagnostic reached stdout' >&2
             exit 1
@@ -136,7 +209,7 @@ jobs:
           # ...and the same directory with no rule against it stays silent.
           rm repro/.dockerignore
           unbuilt repro/Dockerfile --context repro | tee nogit.txt
-          grep -qF 'Every instruction has an effect on this build.' nogit.txt
+          grep -qxF 'Every instruction has an effect on this build.' nogit.txt
 
       # logbook#49, the other direction: the same line in a stage the target
       # does not build. `docker build .` on this exits 0, so an exit 1 here is
@@ -203,14 +276,14 @@ jobs:
           printf 'FROM alpine AS app\nADD %s /b\nRUN use-it\n' "$url" \
             > addurl.Dockerfile
           unbuilt addurl.Dockerfile | tee add.txt
-          grep -qF 'Every instruction has an effect on this build.' add.txt
+          grep -qxF 'Every instruction has an effect on this build.' add.txt
 
       - name: a clean Dockerfile exits 0 and says so
         run: |
           set -euo pipefail
           printf 'FROM alpine AS app\nENV A=1\nRUN use-it\n' > clean.Dockerfile
           unbuilt clean.Dockerfile | tee clean.txt
-          grep -qF 'Every instruction has an effect on this build.' clean.txt
+          grep -qxF 'Every instruction has an effect on this build.' clean.txt
 
       # The README's "When --target names no stage" section, asserted on the
       # channel it is about: a typo must not be able to reach stdout-only
@@ -232,6 +305,10 @@ jobs:
             esac
             test "$status" -eq 2
             grep -qF 'no stage named buidler' err.txt
+            # ...prefixed, which is the control for no_diagnostic_on_stdout
+            # below: that guard searches stdout for `unbuilt: ` and is only
+            # evidence while `unbuilt: ` is a string this program still emits.
+            grep -qF 'unbuilt: ' err.txt
           done
 
           # ...and it is *not* on stdout in the two modes whose stdout is for
